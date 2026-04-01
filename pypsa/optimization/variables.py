@@ -153,3 +153,22 @@ def define_loss_variables(n: Network, sns: Sequence, c: str) -> None:
     active = get_activity_mask(n, c, sns) if n._multi_invest else None
     coords = [sns, n.df(c).index.rename(c)]
     n.model.add_variables(0, coords=coords, name=f"{c}-loss", mask=active)
+
+
+def define_line_x_variables(n: Network, sns: Sequence) -> None:
+    """
+    Initialize LineX-specific variables.
+    """
+    c = "LineX"
+    if c not in n.components or n.df(c).empty:
+        return
+
+    active = get_activity_mask(n, c, sns) if n._multi_invest else None
+    coords = [sns, n.df(c).index.rename(c)]
+    n.model.add_variables(coords=coords, name=f"{c}-q_sssc", mask=active)
+
+    ext_i = n.df(c).index[n.df(c).sssc_nom_extendable].rename(f"{c}-sssc-ext")
+    if ext_i.empty:
+        return
+
+    n.model.add_variables(coords=[ext_i], name=f"{c}-sssc_nom")

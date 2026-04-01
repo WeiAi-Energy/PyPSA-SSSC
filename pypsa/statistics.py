@@ -545,6 +545,12 @@ class StatisticsAccessor:
 
         @pass_empty_series_if_keyerror
         def func(n: Network, c: str, port: str) -> pd.Series:
+            if c == "LineX" and cost_attribute == "capital_cost":
+                df = n.df(c)
+                return (
+                    df["s_nom_opt"] * df["capital_cost"]
+                    + df["sssc_nom_opt"] * df["capital_cost_sssc"]
+                )
             col = n.df(c).eval(f"{nominal_attrs[c]}_opt * {cost_attribute}")
             return col
 
@@ -586,6 +592,12 @@ class StatisticsAccessor:
 
         @pass_empty_series_if_keyerror
         def func(n: Network, c: str, port: str) -> pd.Series:
+            if c == "LineX" and cost_attribute == "capital_cost":
+                df = n.df(c)
+                return (
+                    df["s_nom"] * df["capital_cost"]
+                    + df["sssc_nom"] * df["capital_cost_sssc"]
+                )
             col = n.df(c).eval(f"{nominal_attrs[c]} * {cost_attribute}")
             return col
 

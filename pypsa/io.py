@@ -510,7 +510,7 @@ def _export_to_exporter(
         attr: getattr(network, attr)
         for attr in dir(network)
         if (
-            not attr.startswith("__")
+            not attr.startswith("_")
             and isinstance(getattr(network, attr), allowed_types)
         )
     }

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import xarray as xr
 from geopandas.testing import assert_geodataframe_equal
 from numpy.testing import assert_array_almost_equal as equal
 
@@ -33,6 +34,18 @@ def test_netcdf_io_datetime(tmpdir):
     imported_sns = pypsa.Network(fn).snapshots
 
     assert (imported_sns == exported_sns).all()
+
+
+def test_netcdf_io_ignores_private_bool_network_attrs(tmpdir):
+    fn = os.path.join(tmpdir, "netcdf_private_attrs.nc")
+    n = pypsa.Network()
+    n.add("Bus", "bus")
+    n._objective_constant_missing_from_expression = True
+
+    n.export_to_netcdf(fn)
+
+    with xr.open_dataset(fn) as ds:
+        assert "network__objective_constant_missing_from_expression" not in ds.attrs
 
 
 @pytest.mark.parametrize("meta", [{"test": "test"}, {"test": {"test": "test"}}])

@@ -24,11 +24,15 @@ from pypsa.optimization.abstract import (
     optimize_transmission_expansion_iteratively,
     optimize_with_rolling_horizon,
 )
-from pypsa.optimization.common import get_strongly_meshed_buses, set_from_frame
+from pypsa.optimization.common import (
+    get_strongly_meshed_buses,
+    set_from_frame,
+)
 from pypsa.optimization.constraints import (
     define_fixed_nominal_constraints,
     define_fixed_operation_constraints,
     define_kirchhoff_voltage_constraints,
+    define_line_x_sssc_constraints,
     define_loss_constraints,
     define_modular_constraints,
     define_nodal_balance_constraints,
@@ -50,6 +54,7 @@ from pypsa.optimization.global_constraints import (
     define_transmission_volume_expansion_limit,
 )
 from pypsa.optimization.variables import (
+    define_line_x_variables,
     define_loss_variables,
     define_modular_variables,
     define_nominal_variables,
@@ -72,7 +77,9 @@ lookup = pd.read_csv(
 )
 
 
-def define_objective(n: Network, sns: pd.Index) -> None:
+def define_objective(
+    n: Network, sns: pd.Index, include_objective_constant: bool = False
+) -> None:
     """
     Defines and writes out the objective function.
     """
@@ -105,8 +112,27 @@ def define_objective(n: Network, sns: pd.Index) -> None:
 
         constant += (cost * n.df(c)[attr][ext_i]).sum()
 
+    if "LineX" in n.components and not n.df("LineX").empty:
+        ext_i = n.df("LineX").index[n.df("LineX").sssc_nom_extendable].rename(
+            "LineX-sssc-ext"
+        )
+        cost = n.df("LineX")["capital_cost_sssc"].reindex(ext_i)
+        if not cost.empty:
+            if n._multi_invest:
+                active = pd.concat(
+                    {
+                        period: n.get_active_assets("LineX", period)[ext_i]
+                        for period in sns.unique("period")
+                    },
+                    axis=1,
+                )
+                cost = active @ period_weighting * cost
+            constant += (cost * n.df("LineX")["sssc_nom"].reindex(ext_i)).sum()
+
     n.objective_constant = constant
-    if constant != 0:
+    n._objective_constant_missing_from_expression = False
+
+    if constant != 0 and include_objective_constant:
         object_const = m.add_variables(constant, constant, name="objective_constant")
         objective.append(-1 * object_const)
 
@@ -181,6 +207,27 @@ def define_objective(n: Network, sns: pd.Index) -> None:
         caps = m[f"{c}-{attr}"]
         objective.append((caps * cost).sum())
 
+    if (
+        "LineX" in n.components
+        and not n.df("LineX").empty
+        and "LineX-sssc_nom" in m.variables
+    ):
+        ext_i = n.df("LineX").index[n.df("LineX").sssc_nom_extendable].rename(
+            "LineX-sssc-ext"
+        )
+        cost = n.df("LineX")["capital_cost_sssc"].reindex(ext_i)
+        if n._multi_invest:
+            active = pd.concat(
+                {
+                    period: n.get_active_assets("LineX", period)[ext_i]
+                    for period in sns.unique("period")
+                },
+                axis=1,
+            )
+            cost = active @ period_weighting * cost
+
+        objective.append((m["LineX-sssc_nom"] * cost).sum())
+
     # unit commitment
     keys = ["start_up", "shut_down"]  # noqa: F841
     for c, attr in lookup.query("variable in @keys").index:
@@ -197,7 +244,12 @@ def define_objective(n: Network, sns: pd.Index) -> None:
             "Please make sure the components have assigned costs."
         )
 
-    m.objective = sum(objective) if is_quadratic else merge(objective)
+    objective_expression = sum(objective) if is_quadratic else merge(objective)
+
+    if constant != 0 and not include_objective_constant:
+        n._objective_constant_missing_from_expression = True
+
+    m.objective = objective_expression
 
 
 def create_model(
@@ -206,6 +258,7 @@ def create_model(
     multi_investment_periods: bool = False,
     transmission_losses: int = 0,
     linearized_unit_commitment: bool = False,
+    include_objective_constant: bool = False,
     **kwargs: Any,
 ) -> Model:
     """
@@ -225,6 +278,9 @@ def create_model(
     transmission_losses : int, default 0
     linearized_unit_commitment : bool, default False
         Whether to optimise using the linearised unit commitment formulation or not.
+    include_objective_constant : bool, default False
+        Whether to include the objective constant for existing extendable assets
+        via a helper variable in the model objective.
     **kwargs:
         Keyword arguments used by `linopy.Model()`, such as `solver_dir` or `chunk`.
 
@@ -240,6 +296,7 @@ def create_model(
     kwargs.setdefault("force_dim_names", True)
     n.model = Model(**kwargs)
     n.model.parameters = n.model.parameters.assign(snapshots=sns)
+    n._global_constraint_scales = {}
 
     # Define variables
     for c, attr in lookup.query("nominal").index:
@@ -254,6 +311,7 @@ def create_model(
 
     define_spillage_variables(n, sns)
     define_operational_variables(n, sns, "Store", "p")
+    define_line_x_variables(n, sns)
 
     if transmission_losses:
         for c in n.passive_branch_components:
@@ -297,6 +355,7 @@ def create_model(
         )
 
     define_kirchhoff_voltage_constraints(n, sns)
+    define_line_x_sssc_constraints(n, sns)
     define_storage_unit_constraints(n, sns)
     define_store_constraints(n, sns)
 
@@ -313,7 +372,7 @@ def create_model(
     define_nominal_constraints_per_bus_carrier(n, sns)
     define_growth_limit(n, sns)
 
-    define_objective(n, sns)
+    define_objective(n, sns, include_objective_constant)
 
     return n.model
 
@@ -364,12 +423,21 @@ def assign_solution(n: Network) -> None:
         if not fix_i.empty:
             n.df(c).loc[fix_i, f"{attr}_opt"] = n.df(c).loc[fix_i, attr]
 
+    if "LineX" in n.components and not n.df("LineX").empty:
+        fix_i = n.df("LineX").index[~n.df("LineX").sssc_nom_extendable]
+        if not fix_i.empty:
+            n.df("LineX").loc[fix_i, "sssc_nom_opt"] = n.df("LineX").loc[
+                fix_i, "sssc_nom"
+            ]
+
     # recalculate storageunit net dispatch
     if not n.df("StorageUnit").empty:
         c = "StorageUnit"
         n.pnl(c)["p"] = n.pnl(c)["p_dispatch"] - n.pnl(c)["p_store"]
 
     n.objective = m.objective.value
+    if getattr(n, "_objective_constant_missing_from_expression", False):
+        n.objective -= getattr(n, "objective_constant", 0.0)
 
 
 def assign_duals(n: Network, assign_all_duals: bool = False) -> None:
@@ -417,13 +485,14 @@ def assign_duals(n: Network, assign_all_duals: bool = False) -> None:
                 unassigned.append(name)
 
         elif (c == "GlobalConstraint") and (assign_all_duals or attr in n.df(c).index):
-            n.df(c).loc[attr, "mu"] = dual
+            scale = getattr(n, "_global_constraint_scales", {}).get(attr, 1.0)
+            n.df(c).loc[attr, "mu"] = dual * scale
 
-    if unassigned:
-        logger.info(
-            f"The shadow-prices of the constraints {', '.join(unassigned)} were "
-            "not assigned to the network."
-        )
+    # if unassigned:
+    #     logger.info(
+    #         f"The shadow-prices of the constraints {', '.join(unassigned)} were "
+    #         "not assigned to the network."
+    #     )
 
 
 def post_processing(n: Network) -> None:
@@ -452,11 +521,14 @@ def post_processing(n: Network) -> None:
     if len(n.loads):
         set_from_frame(n, "Load", "p", get_as_dense(n, "Load", "p_set", sns))
 
-    # line losses
-    if "Line-loss" in n.model.variables:
-        losses = n.model["Line-loss"].solution.to_pandas()
-        n.lines_t.p0 += losses / 2
-        n.lines_t.p1 += losses / 2
+    # passive branch losses
+    for c in n.passive_branch_components:
+        name = f"{c}-loss"
+        if name not in n.model.variables:
+            continue
+        losses = n.model[name].solution.to_pandas()
+        n.pnl(c).p0 += losses / 2
+        n.pnl(c).p1 += losses / 2
 
     # recalculate injection
     ca = [
@@ -516,6 +588,7 @@ def optimize(
     solver_name: str = "highs",
     solver_options: dict = {},
     compute_infeasibilities: bool = False,
+    include_objective_constant: bool = False,
     **kwargs: Any,
 ) -> tuple[str, str]:
     """
@@ -555,6 +628,9 @@ def optimize(
     compute_infeasibilities : bool, default False
         Whether to compute and print Irreducible Inconsistent Subsystem (IIS) in case
         of an infeasible solution. Requires Gurobi.
+    include_objective_constant : bool, default False
+        Whether to include the objective constant for existing extendable assets
+        via a helper variable in the model objective.
     **kwargs:
         Keyword argument used by `linopy.Model.solve`, such as `solver_name`,
         `problem_fn` or solver options directly passed to the solver.
@@ -581,6 +657,7 @@ def optimize(
         multi_investment_periods,
         transmission_losses,
         linearized_unit_commitment,
+        include_objective_constant,
         **model_kwargs,
     )
     if extra_functionality:

@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import pypsa
 from pypsa.clustering.spatial import (
     aggregateoneport,
     busmap_by_hac,
@@ -130,6 +131,56 @@ def test_aggregate_storage_units_consent_error(ac_dc_network):
     busmap = pd.Series("all", n.buses.index)
     with pytest.raises(AssertionError):
         df, pnl = aggregateoneport(n, busmap, "StorageUnit")
+
+
+def test_aggregate_loads_dynamic_sum_float32_tolerance():
+    n = pypsa.Network()
+    n.set_snapshots(range(3))
+    n.add("Bus", "bus0")
+    n.add("Bus", "bus1")
+    n.add("Load", "load0", bus="bus0", p_set=1000.0)
+    n.add("Load", "load1", bus="bus1", p_set=2000.0)
+
+    n.loads_t.p_set = pd.DataFrame(
+        {
+            "load0": [1000.125, 1000.25, 1000.375],
+            "load1": [2000.5, 2000.625, 2000.75],
+        },
+        index=n.snapshots,
+    )
+
+    busmap = pd.Series("all", n.buses.index)
+    df, pnl = aggregateoneport(n, busmap, "Load")
+
+    expected = n.loads_t.p_set.sum(axis=1)
+
+    assert df.loc["all", "p_set"] == 3000.0
+    np.testing.assert_allclose(
+        pnl["p_set"]["all"], expected, rtol=1e-6, atol=1e-4
+    )
+
+
+def test_aggregate_loads_static_series_filtered_after_float32_aggregation():
+    n = pypsa.Network()
+    n.set_snapshots(range(3))
+    n.add("Bus", "bus0")
+    n.add("Bus", "bus1")
+    n.add("Load", "load0", bus="bus0", p_set=1000.125)
+    n.add("Load", "load1", bus="bus1", p_set=2000.25)
+
+    n.loads_t.p_set = pd.DataFrame(
+        {
+            "load0": [1000.125, 1000.125, 1000.125],
+            "load1": [2000.25, 2000.25, 2000.25],
+        },
+        index=n.snapshots,
+    )
+
+    busmap = pd.Series("all", n.buses.index)
+    df, pnl = aggregateoneport(n, busmap, "Load")
+
+    assert df.loc["all", "p_set"] == 3000.375
+    assert pnl["p_set"].empty
 
 
 def prepare_network_for_aggregation(n):

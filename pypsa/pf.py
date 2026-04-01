@@ -863,42 +863,41 @@ def apply_line_types(network: Network) -> None:
     """
     Calculate line electrical parameters x, r, b, g from standard types.
     """
-    lines_with_types_b = network.lines.type != ""
-    if lines_with_types_b.zsum() == 0:
-        return
+    for df in (network.lines, network.line_xs):
+        lines_with_types_b = df.type != ""
+        if lines_with_types_b.zsum() == 0:
+            continue
 
-    missing_types = pd.Index(
-        network.lines.loc[lines_with_types_b, "type"].unique()
-    ).difference(network.line_types.index)
-    if not missing_types.empty:
-        msg = (
-            f'The type(s) {", ".join(missing_types)} do(es) not exist in '
-            f"network.line_types"
+        missing_types = pd.Index(df.loc[lines_with_types_b, "type"].unique()).difference(
+            network.line_types.index
         )
-        raise ValueError(msg)
+        if not missing_types.empty:
+            msg = (
+                f'The type(s) {", ".join(missing_types)} do(es) not exist in '
+                f"network.line_types"
+            )
+            raise ValueError(msg)
 
-    # Get a copy of the lines data
-    lines = network.lines.loc[
-        lines_with_types_b, ["type", "length", "num_parallel"]
-    ].join(network.line_types, on="type")
-
-    for attr in ["r", "x"]:
-        lines[attr] = (
-            lines[attr + "_per_length"] * lines["length"] / lines["num_parallel"]
+        lines = df.loc[lines_with_types_b, ["type", "length", "num_parallel"]].join(
+            network.line_types, on="type"
         )
-    lines["b"] = (
-        2
-        * np.pi
-        * 1e-9
-        * lines["f_nom"]
-        * lines["c_per_length"]
-        * lines["length"]
-        * lines["num_parallel"]
-    )
 
-    # now set calculated values on live lines
-    for attr in ["r", "x", "b"]:
-        network.lines.loc[lines_with_types_b, attr] = lines[attr]
+        for attr in ["r", "x"]:
+            lines[attr] = (
+                lines[attr + "_per_length"] * lines["length"] / lines["num_parallel"]
+            )
+        lines["b"] = (
+            2
+            * np.pi
+            * 1e-9
+            * lines["f_nom"]
+            * lines["c_per_length"]
+            * lines["length"]
+            * lines["num_parallel"]
+        )
+
+        for attr in ["r", "x", "b"]:
+            df.loc[lines_with_types_b, attr] = lines[attr]
 
 
 def apply_transformer_types(network: Network) -> None:
@@ -1018,6 +1017,17 @@ def calculate_dependent_values(network: Network) -> None:
     network.lines["g_pu"] = network.lines.g * network.lines.v_nom**2
     network.lines["x_pu_eff"] = network.lines["x_pu"]
     network.lines["r_pu_eff"] = network.lines["r_pu"]
+
+    network.line_xs["v_nom"] = network.line_xs.bus0.map(network.buses.v_nom)
+    network.line_xs.loc[network.line_xs.carrier == "", "carrier"] = (
+        network.line_xs.bus0.map(network.buses.carrier)
+    )
+    network.line_xs["x_pu"] = network.line_xs.x / (network.line_xs.v_nom**2)
+    network.line_xs["r_pu"] = network.line_xs.r / (network.line_xs.v_nom**2)
+    network.line_xs["b_pu"] = network.line_xs.b * network.line_xs.v_nom**2
+    network.line_xs["g_pu"] = network.line_xs.g * network.line_xs.v_nom**2
+    network.line_xs["x_pu_eff"] = network.line_xs["x_pu"]
+    network.line_xs["r_pu_eff"] = network.line_xs["r_pu"]
 
     # convert transformer impedances from base power s_nom to base = 1 MVA
     network.transformers["x_pu"] = network.transformers.x / network.transformers.s_nom

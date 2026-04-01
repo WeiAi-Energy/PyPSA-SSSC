@@ -1110,6 +1110,14 @@ class Network(Basic):
         for df in pnl.values():
             df.drop(df.columns.intersection(names), axis=1, inplace=True)
 
+    def convert_lines_to_line_x(
+        self, names: Sequence[str] | str | None = None, **kwargs: Any
+    ) -> pd.Index:
+        """
+        Convert ``Line`` components in-place to ``LineX``.
+        """
+        return convert_lines_to_line_x(self, names=names, **kwargs)
+
     def _retrieve_overridden_components(self) -> tuple[pd.DataFrame, Dict]:
         components_index = list(self.components.keys())
 
@@ -1560,6 +1568,9 @@ class SubNetwork(Common):
     def lines_i(self) -> pd.Index:
         return self.network.lines.index[self.network.lines.sub_network == self.name]
 
+    def line_xs_i(self) -> pd.Index:
+        return self.network.line_xs.index[self.network.line_xs.sub_network == self.name]
+
     def transformers_i(self) -> pd.Index:
         return self.network.transformers.index[
             self.network.transformers.sub_network == self.name
@@ -1576,6 +1587,9 @@ class SubNetwork(Common):
     def branches(self) -> pd.DataFrame:
         branches = self.network.passive_branches()
         return branches[branches.sub_network == self.name]
+
+    def line_xs(self) -> pd.DataFrame:
+        return self.network.line_xs.loc[self.line_xs_i()]
 
     def generators_i(self) -> pd.Index:
         sub_networks = self.network.generators.bus.map(self.network.buses.sub_network)
@@ -1648,3 +1662,113 @@ class SubNetwork(Common):
             c = Component(c.name, c.list_name, c.attrs, c.df.loc[ind], pnl, ind)
             if not (skip_empty and len(ind) == 0):
                 yield c
+
+
+def convert_lines_to_line_x(
+    network: Network, names: Sequence[str] | str | None = None, **kwargs: Any
+) -> pd.Index:
+    """
+    Convert lines in a network to ``LineX`` assets.
+    """
+    if names is None:
+        line_i = network.lines.index
+    elif isinstance(names, pd.Index):
+        line_i = names
+    elif isinstance(names, str):
+        line_i = pd.Index([names])
+    else:
+        line_i = pd.Index(names)
+    line_i.name = "Line"
+
+    missing = line_i.difference(network.lines.index)
+    if not missing.empty:
+        raise KeyError(f"Line names not found in network.lines: {missing}")
+
+    if line_i.empty:
+        return line_i.rename("LineX")
+
+    carriers = network.lines.loc[line_i, "bus0"].map(network.buses.carrier)
+    invalid = line_i[carriers != "AC"]
+    if not invalid.empty:
+        raise ValueError(f"LineX only supports AC lines, got: {invalid}")
+
+    overlap = line_i.intersection(network.line_xs.index)
+    if not overlap.empty:
+        raise ValueError(
+            f"Cannot convert lines to LineX due to existing name conflicts: {overlap}"
+        )
+
+    line_attrs = network.components["Line"]["attrs"]
+    line_x_attrs = network.components["LineX"]["attrs"]
+
+    line_input = line_attrs.index[line_attrs.status.str.startswith("Input")]
+    line_input_varying = line_input[line_attrs.loc[line_input, "varying"]]
+    line_x_input = line_x_attrs.index[line_x_attrs.status.str.startswith("Input")]
+    line_x_static_input = line_x_input[line_x_attrs.loc[line_x_input, "static"]]
+    line_x_varying_input = line_x_input[line_x_attrs.loc[line_x_input, "varying"]]
+
+    line_x_df = pd.DataFrame(index=line_i)
+    common_static = network.lines.columns.intersection(line_x_static_input)
+    if not common_static.empty:
+        line_x_df = pd.concat(
+            (line_x_df, network.lines.loc[line_i, common_static]), axis=1
+        )
+
+    if "capital_cost_sssc" not in kwargs:
+        raise TypeError("convert_lines_to_line_x requires `capital_cost_sssc`.")
+
+    line_x_df["sssc_nom"] = kwargs.pop("sssc_nom", 0.0)
+    line_x_df["sssc_nom_min"] = kwargs.pop("sssc_nom_min", 0.0)
+    line_x_df["sssc_nom_max"] = kwargs.pop("sssc_nom_max", np.inf)
+    line_x_df["sssc_nom_extendable"] = kwargs.pop("sssc_nom_extendable", True)
+    line_x_df["capital_cost_sssc"] = kwargs.pop("capital_cost_sssc")
+
+    series_kwargs: dict[str, pd.DataFrame] = {}
+    static_kwargs: dict[str, Any] = {}
+    for attr, value in kwargs.items():
+        if attr not in line_x_attrs.index:
+            raise KeyError(f"LineX has no attribute '{attr}'.")
+
+        if isinstance(value, pd.DataFrame):
+            series_kwargs[attr] = value
+        elif isinstance(value, np.ndarray) and value.shape == (
+            len(network.snapshots),
+            len(line_i),
+        ):
+            series_kwargs[attr] = pd.DataFrame(
+                value, index=network.snapshots, columns=line_i
+            )
+        else:
+            static_kwargs[attr] = value
+
+    for attr in series_kwargs:
+        if attr not in line_x_varying_input:
+            raise ValueError(
+                f"LineX attribute '{attr}' is not time-varying input and cannot "
+                "be set from a DataFrame/2D array."
+            )
+
+    for attr, value in static_kwargs.items():
+        if isinstance(value, pd.Series):
+            line_x_df[attr] = value.reindex(line_i)
+        else:
+            line_x_df[attr] = value
+
+    network.import_components_from_dataframe(line_x_df, "LineX")
+
+    copy_series_attrs = line_input_varying.intersection(line_x_varying_input)
+    for attr in copy_series_attrs:
+        src = network.lines_t[attr]
+        if src.empty:
+            continue
+        network.import_series_from_dataframe(
+            src.reindex(index=network.snapshots, columns=line_i), "LineX", attr
+        )
+
+    for attr, value in series_kwargs.items():
+        network.import_series_from_dataframe(
+            value.reindex(index=network.snapshots, columns=line_i), "LineX", attr
+        )
+
+    network.mremove("Line", line_i)
+    return line_i.rename("LineX")

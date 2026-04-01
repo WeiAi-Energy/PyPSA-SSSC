@@ -5,6 +5,7 @@ Bus,buses,"Electrically fundamental node where x-port objects attach."
 Carrier,carriers,"Energy carrier, such as AC, DC, heat, wind, PV or coal. Buses have direct carriers and Generators indicate their primary energy carriers.  The Carrier can track properties relevant for global constraints, such as CO2 emissions."
 GlobalConstraint,global_constraints,"Constraints for OPF that affect many components, such as CO2 emission constraints."
 Line,lines,"Lines include distribution and transmission lines, overhead lines and cables.",passive_branch
+LineX,line_xs,"Transmission line with optional SSSC investment and controllable series reactance in optimization.",passive_branch
 LineType,line_types,"Standard line types with per length values for impedances.",standard_type
 Transformer,transformers,"2-winding transformer.",passive_branch
 TransformerType,transformer_types,"Standard 2-winding transformer types.",standard_type

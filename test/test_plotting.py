@@ -129,6 +129,26 @@ def test_plot_with_line_cmap(ac_dc_network):
     plt.close()
 
 
+def test_plot_with_line_x_cmap(ac_dc_network):
+    n = ac_dc_network.copy()
+    line_x = n.lines.index[0]
+    n.convert_lines_to_line_x(line_x, capital_cost_sssc=1.0)
+
+    widths = pd.Series(1.5, index=n.lines.index.append(n.line_xs.index))
+    colors = pd.Series(
+        np.linspace(0.0, 1.0, len(widths), endpoint=False),
+        index=widths.index,
+    )
+
+    n.plot(
+        line_widths=widths,
+        line_colors=colors,
+        line_cmap="coolwarm",
+        geomap=False,
+    )
+    plt.close()
+
+
 def test_plot_alpha(ac_dc_network):
     n = ac_dc_network
 

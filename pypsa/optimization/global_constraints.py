@@ -21,6 +21,22 @@ from pypsa.descriptors import nominal_attrs
 if TYPE_CHECKING:
     from pypsa import Network
 logger = logging.getLogger(__name__)
+TRANSMISSION_GLOBAL_CONSTRAINT_SCALE = 1e3
+
+
+def _scale_global_constraint(
+    n: Network, name: str, lhs, rhs: float, scale: float
+):
+    """
+    Improve model numerics by scaling selected global constraints while
+    preserving their physical meaning.
+    """
+    scales = getattr(n, "_global_constraint_scales", None)
+    if scales is None:
+        scales = {}
+        setattr(n, "_global_constraint_scales", scales)
+    scales[name] = scale
+    return lhs * (1 / scale), rhs / scale
 
 
 def define_tech_capacity_expansion_limit(n: Network, sns: Sequence) -> None:
@@ -405,6 +421,30 @@ def define_transmission_volume_expansion_limit(n: Network, sns: Sequence) -> Non
     def substr(s: str) -> str:
         return re.sub("[\\[\\]\\(\\)]", "", s)
 
+    def filter_active_assets(
+        component: str, index: pd.Index, period: float
+    ) -> tuple[pd.Index, int | pd.Series]:
+        if index.empty:
+            return index, 1
+
+        if not isnan(period):
+            index = index[n.get_active_assets(component, period)[index]]
+            return index.rename(index.name), 1
+
+        if isinstance(sns, pd.MultiIndex):
+            index = index[n.get_active_assets(component, sns.unique("period"))[index]]
+            index = index.rename(index.name)
+            active = pd.concat(
+                {
+                    period: n.get_active_assets(component, period)[index]
+                    for period in sns.unique("period")
+                },
+                axis=1,
+            )
+            return index, active @ period_weighting
+
+        return index.rename(index.name), 1
+
     for name, glc in glcs.iterrows():
         lhs = []
         # fmt: off
@@ -413,7 +453,7 @@ def define_transmission_volume_expansion_limit(n: Network, sns: Sequence) -> Non
         # fmt: on
         period = glc.investment_period
 
-        for c in ["Line", "Link"]:
+        for c in ["Line", "LineX", "Link"]:
             attr = nominal_attrs[c]
 
             ext_i = n.get_extendable_i(c)
@@ -442,8 +482,15 @@ def define_transmission_volume_expansion_limit(n: Network, sns: Sequence) -> Non
             continue
 
         lhs = merge(lhs)
+        lhs, rhs = _scale_global_constraint(
+            n,
+            name,
+            lhs,
+            glc.constant,
+            TRANSMISSION_GLOBAL_CONSTRAINT_SCALE,
+        )
         sign = "=" if glc.sense == "==" else glc.sense
-        m.add_constraints(lhs, sign, glc.constant, name=f"GlobalConstraint-{name}")
+        m.add_constraints(lhs, sign, rhs, name=f"GlobalConstraint-{name}")
 
 
 def define_transmission_expansion_cost_limit(n: Network, sns: pd.Index) -> None:
@@ -471,6 +518,30 @@ def define_transmission_expansion_cost_limit(n: Network, sns: pd.Index) -> None:
     def substr(s: str) -> str:
         return re.sub("[\\[\\]\\(\\)]", "", s)
 
+    def filter_active_assets(
+        component: str, index: pd.Index, period: float
+    ) -> tuple[pd.Index, int | pd.Series]:
+        if index.empty:
+            return index, 1
+
+        if not isnan(period):
+            index = index[n.get_active_assets(component, period)[index]]
+            return index.rename(index.name), 1
+
+        if isinstance(sns, pd.MultiIndex):
+            index = index[n.get_active_assets(component, sns.unique("period"))[index]]
+            index = index.rename(index.name)
+            active = pd.concat(
+                {
+                    period: n.get_active_assets(component, period)[index]
+                    for period in sns.unique("period")
+                },
+                axis=1,
+            )
+            return index, active @ period_weighting
+
+        return index.rename(index.name), 1
+
     for name, glc in glcs.iterrows():
         lhs = []
         # fmt: off
@@ -479,7 +550,7 @@ def define_transmission_expansion_cost_limit(n: Network, sns: pd.Index) -> None:
         # fmt: on
         period = glc.investment_period
 
-        for c in ["Line", "Link"]:
+        for c in ["Line", "LineX", "Link"]:
             attr = nominal_attrs[c]
 
             ext_i = n.get_extendable_i(c)
@@ -489,25 +560,10 @@ def define_transmission_expansion_cost_limit(n: Network, sns: pd.Index) -> None:
             ext_i = ext_i.intersection(n.df(c).query("carrier in @car").index).rename(
                 ext_i.name
             )
+            ext_i, weights = filter_active_assets(c, ext_i, period)
 
-            if not isnan(period):
-                ext_i = ext_i[n.get_active_assets(c, period)[ext_i]].rename(ext_i.name)
-                weights = 1
-
-            elif isinstance(sns, pd.MultiIndex):
-                ext_i = ext_i[
-                    n.get_active_assets(c, sns.unique("period"))[ext_i]
-                ].rename(ext_i.name)
-                active = pd.concat(
-                    {
-                        period: n.get_active_assets(c, period)[ext_i]
-                        for period in sns.unique("period")
-                    },
-                    axis=1,
-                )
-                weights = active @ period_weighting
-            else:
-                weights = 1
+            if ext_i.empty:
+                continue
 
             cost = n.df(c).capital_cost.reindex(ext_i) * weights
             vars = m[f"{c}-{attr}"].loc[ext_i]
@@ -517,5 +573,12 @@ def define_transmission_expansion_cost_limit(n: Network, sns: pd.Index) -> None:
             continue
 
         lhs = merge(lhs)
+        lhs, rhs = _scale_global_constraint(
+            n,
+            name,
+            lhs,
+            glc.constant,
+            TRANSMISSION_GLOBAL_CONSTRAINT_SCALE,
+        )
         sign = "=" if glc.sense == "==" else glc.sense
-        m.add_constraints(lhs, sign, glc.constant, name=f"GlobalConstraint-{name}")
+        m.add_constraints(lhs, sign, rhs, name=f"GlobalConstraint-{name}")

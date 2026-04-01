@@ -263,6 +263,7 @@ def zsum(s: pd.Series, *args: Any, **kwargs: Any) -> Any:
 nominal_attrs = {
     "Generator": "p_nom",
     "Line": "s_nom",
+    "LineX": "s_nom",
     "Transformer": "s_nom",
     "Link": "p_nom",
     "Store": "e_nom",

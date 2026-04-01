@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import linopy
+import numpy as np
 import pandas as pd
 from linopy import LinearExpression, merge
 from numpy import inf, isfinite
@@ -542,6 +543,8 @@ def define_nodal_balance_constraints(
         ["StorageUnit", "p_store", "bus", -1],
         ["Line", "s", "bus0", -1],
         ["Line", "s", "bus1", 1],
+        ["LineX", "s", "bus0", -1],
+        ["LineX", "s", "bus1", 1],
         ["Transformer", "s", "bus0", -1],
         ["Transformer", "s", "bus1", 1],
         ["Link", "p", "bus0", -1],
@@ -553,11 +556,16 @@ def define_nodal_balance_constraints(
             eff = get_as_dense(n, "Link", f"efficiency{i}", sns)
             args.append(["Link", "p", f"bus{i}", eff])
 
-    if transmission_losses:
+    include_loss_terms = transmission_losses and not getattr(
+        n, "_rtep_inner_losses_accounted_in_bus_injection", False
+    )
+    if include_loss_terms:
         args.extend(
             [
                 ["Line", "loss", "bus0", -0.5],
                 ["Line", "loss", "bus1", -0.5],
+                ["LineX", "loss", "bus0", -0.5],
+                ["LineX", "loss", "bus1", -0.5],
                 ["Transformer", "loss", "bus0", -0.5],
                 ["Transformer", "loss", "bus1", -0.5],
             ]
@@ -630,6 +638,9 @@ def define_kirchhoff_voltage_constraints(n: Network, sns: pd.Index) -> None:
 
     names = ["component", "name"]
     s = pd.concat({c: m[f"{c}-s"].to_pandas() for c in comps}, axis=1, names=names)
+    line_x_q = None
+    if "LineX-q_sssc" in m.variables:
+        line_x_q = m["LineX-q_sssc"].to_pandas()
 
     lhs = []
 
@@ -649,16 +660,47 @@ def define_kirchhoff_voltage_constraints(n: Network, sns: pd.Index) -> None:
 
             carrier = n.sub_networks.carrier[sub.name]
             weightings = branches.x_pu_eff if carrier == "AC" else branches.r_pu_eff
-            C = 1e5 * sparse.diags(weightings.values) * sub.C
+            C_flow = 1e4 * sparse.diags(weightings.values) * sub.C
             ssub = s.loc[snapshots, branches.index].values
 
-            ncycles = C.shape[1]
+            if isinstance(branches.index, pd.MultiIndex):
+                branches_component = branches.index.get_level_values(0)
+                branches_name = branches.index.get_level_values(1)
+            else:
+                branches_component = pd.Index(["Line"] * len(branches.index))
+                branches_name = branches.index
+
+            s_nom_def = pd.Series(np.nan, index=branches.index, dtype=float)
+            if "LineX" in branches_component:
+                line_x_i = branches_name[branches_component == "LineX"]
+                defs = n.line_xs.get("_s_nom_def", n.line_xs.s_nom).reindex(line_x_i)
+                s_nom_def.loc[pd.MultiIndex.from_arrays(
+                    [pd.Index(["LineX"] * len(line_x_i)), line_x_i]
+                )] = defs.values
+
+            ncycles = C_flow.shape[1]
 
             for j in range(ncycles):
-                c = C.getcol(j).tocoo()
-                coeffs = DataArray(c.data, dims="_term")
+                c_flow = C_flow.getcol(j).tocoo()
+                coeffs_parts = [c_flow.data]
+                vars_parts = [ssub[:, c_flow.row]]
+
+                if carrier == "AC" and line_x_q is not None:
+                    c_base = (1e4 * sub.C).getcol(j).tocoo()
+                    if c_base.nnz:
+                        rows = c_base.row
+                        mask = branches_component[rows] == "LineX"
+                        if mask.any():
+                            q_rows = rows[mask]
+                            q_names = branches_name[q_rows]
+                            q_coeffs = -c_base.data[mask] / s_nom_def.iloc[q_rows].to_numpy()
+                            q_vars = line_x_q.loc[snapshots, q_names].values
+                            coeffs_parts.append(q_coeffs)
+                            vars_parts.append(q_vars)
+
+                coeffs = DataArray(np.concatenate(coeffs_parts), dims="_term")
                 vars = DataArray(
-                    ssub[:, c.row],
+                    np.concatenate(vars_parts, axis=1),
                     dims=("snapshot", "_term"),
                     coords={"snapshot": snapshots},
                 )
@@ -673,6 +715,43 @@ def define_kirchhoff_voltage_constraints(n: Network, sns: pd.Index) -> None:
     if len(lhs):
         lhs = merge(lhs, dim="snapshot")
         m.add_constraints(lhs, "=", 0, name="Kirchhoff-Voltage-Law")
+
+
+def define_line_x_sssc_constraints(n: Network, sns: pd.Index) -> None:
+    """
+    Define LineX SSSC capacity and operation constraints.
+    """
+    c = "LineX"
+    if c not in n.components or n.df(c).empty:
+        return
+
+    m = n.model
+    q = m[f"{c}-q_sssc"]
+    ext_i = n.df(c).index[n.df(c).sssc_nom_extendable].rename(f"{c}-sssc-ext")
+    fix_i = n.df(c).index.difference(ext_i).rename(c)
+
+    if not fix_i.empty:
+        active = get_activity_mask(n, c, sns, fix_i) if n._multi_invest else None
+        q_fix = reindex(q, c, fix_i)
+        sssc_fix = n.df(c).sssc_nom.reindex(fix_i)
+        m.add_constraints(q_fix <= sssc_fix, name=f"{c}-fix-q_sssc-upper", mask=active)
+        m.add_constraints(
+            q_fix >= -sssc_fix, name=f"{c}-fix-q_sssc-lower", mask=active
+        )
+
+    if ext_i.empty:
+        return
+
+    active = get_activity_mask(n, c, sns, ext_i) if n._multi_invest else None
+    q_ext = reindex(q, c, ext_i)
+    sssc = m[f"{c}-sssc_nom"]
+    sssc_min = n.df(c).sssc_nom_min.reindex(ext_i)
+    sssc_max = n.df(c).sssc_nom_max.reindex(ext_i)
+
+    m.add_constraints(sssc >= sssc_min, name=f"{c}-sssc_nom-lower")
+    m.add_constraints(sssc <= sssc_max, name=f"{c}-sssc_nom-upper")
+    m.add_constraints(q_ext - sssc <= 0, name=f"{c}-ext-q_sssc-upper", mask=active)
+    m.add_constraints(q_ext + sssc >= 0, name=f"{c}-ext-q_sssc-lower", mask=active)
 
 
 def define_fixed_nominal_constraints(n: Network, c: str, attr: str) -> None:
@@ -935,40 +1014,131 @@ def define_loss_constraints(
     if n.df(c).empty or c not in n.passive_branch_components:
         return
 
+    fixed_losses = getattr(n, "_rtep_inner_fixed_branch_losses", None)
+    if isinstance(fixed_losses, dict) and c in fixed_losses:
+        active = get_activity_mask(n, c, sns) if n._multi_invest else None
+        loss = reindex(n.model[f"{c}-loss"], c, n.df(c).index)
+        fixed_loss = (
+            fixed_losses[c].reindex(
+                index=sns, columns=n.df(c).index, fill_value=0.0
+            ).clip(lower=0.0)
+        )
+        if isinstance(fixed_loss.index, pd.MultiIndex):
+            fixed_loss.index = fixed_loss.index.rename(sns.names)
+        else:
+            fixed_loss.index.name = "snapshot"
+        fixed_loss.columns = fixed_loss.columns.rename(c)
+        if active is not None:
+            active = active.reindex(
+                index=fixed_loss.index, columns=fixed_loss.columns, fill_value=False
+            )
+            fixed_loss = fixed_loss.where(active, 0.0)
+        n.model.add_constraints(
+            loss,
+            "=",
+            fixed_loss,
+            name=f"{c}-loss_fixed_from_outer",
+        )
+        return
+
     tangents = transmission_losses
     active = get_activity_mask(n, c, sns) if n._multi_invest else None
 
     s_max_pu = get_as_dense(n, c, "s_max_pu").loc[sns]
 
-    s_nom_max = n.df(c)["s_nom_max"].where(
-        n.df(c)["s_nom_extendable"], n.df(c)["s_nom"]
+    # Prefer solved capacities when available (e.g. iterative workflows), while
+    # keeping model-build compatibility by falling back to design limits.
+    s_nom_opt = (
+        n.df(c)["s_nom_opt"]
+        if "s_nom_opt" in n.df(c)
+        else pd.Series(np.nan, index=n.df(c).index)
     )
+    s_max = s_nom_opt.where((s_nom_opt > 0) & np.isfinite(s_nom_opt), n.df(c)["s_nom"])
 
-    if not isfinite(s_nom_max).all():
+    if not isfinite(s_max).all():
         msg = (
-            f"Loss approximation requires finite 's_nom_max' for extendable "
-            f"branches:\n {s_nom_max[~isfinite(s_nom_max)]}"
+            "Loss approximation requires finite branch capacities "
+            "(derived from 's_nom_opt' or 's_nom_max/s_nom'):\n "
+            f"{s_max[~isfinite(s_max)]}"
         )
         raise ValueError(msg)
 
     r_pu_eff = n.df(c)["r_pu_eff"]
 
-    upper_limit = r_pu_eff * (s_max_pu * s_nom_max) ** 2
-
     loss = n.model[f"{c}-loss"]
     flow = n.model[f"{c}-s"]
 
-    n.model.add_constraints(loss <= upper_limit, name=f"{c}-loss_upper", mask=active)
+    def fit_piece_analytic(
+        r: float, x0: float, x1: float, through_origin: bool
+    ) -> tuple[float, float]:
+        """
+        Analytic least-squares fit for y = r*p^2 ~= a*p + b on [x0, x1].
+        """
+        if not isfinite(r) or x1 <= x0 or x1 <= 0.0:
+            return 0.0, 0.0
 
-    for k in range(1, tangents + 1):
-        p_k = k / tangents * s_max_pu * s_nom_max
-        loss_k = r_pu_eff * p_k**2
-        slope_k = 2 * r_pu_eff * p_k
-        offset_k = loss_k - slope_k * p_k
+        if through_origin:
+            i2 = (x1**3 - x0**3) / 3.0
+            i3 = 0.25 * (x1**4 - x0**4)
+            if abs(i2) < 1e-16:
+                return 0.0, 0.0
+            return float(r * (i3 / i2)), 0.0
 
-        for sign in [-1, 1]:
-            lhs = n.model.linexpr((1, loss), (sign * slope_k, flow))
+        i0 = x1 - x0
+        i1 = 0.5 * (x1**2 - x0**2)
+        i2 = (x1**3 - x0**3) / 3.0
+        i3 = 0.25 * (x1**4 - x0**4)
 
-            n.model.add_constraints(
-                lhs >= offset_k, name=f"{c}-loss_tangents-{k}-{sign}", mask=active
-            )
+        denom = i2 * i0 - i1**2
+        if abs(denom) < 1e-16:
+            return fit_piece_analytic(r, x0, x1, through_origin=True)
+
+        a = r * (i3 * i0 - i2 * i1) / denom
+        b = r * (i2 * i2 - i3 * i1) / denom
+        return float(a), float(b)
+
+    # Generalized (2n+1)-segment fit on [-p_max, p_max]
+    n_side = max(1, int(tangents))
+    p_max = (s_max_pu * s_max).max(axis=0).to_numpy()
+    r_val = r_pu_eff.to_numpy()
+    idx = n.df(c).index
+    n_br = len(idx)
+
+    slopes = np.zeros((n_br, n_side))
+    offsets = np.zeros((n_br, n_side))
+
+    for i in range(n_br):
+        pmax_i = float(p_max[i]) if isfinite(p_max[i]) else 0.0
+        r_i = float(r_val[i]) if isfinite(r_val[i]) else np.nan
+        if pmax_i <= 0.0 or not isfinite(r_i):
+            continue
+
+        delta_i = pmax_i / (2.0 * n_side + 1.0)
+
+        for k in range(1, n_side + 1):
+            x0 = (2 * k - 1) * delta_i
+            x1 = (2 * k + 1) * delta_i
+            a, b = fit_piece_analytic(r_i, x0, x1, through_origin=False)
+            if b < 0 and b > -1e-14:
+                b = 0.0
+            slopes[i, k - 1] = a
+            offsets[i, k - 1] = b
+
+    n.model.add_constraints(
+        loss >= 0.0,
+        name=f"{c}-loss_center_nonneg",
+        mask=active,
+    )
+
+    for k in range(n_side):
+        slope_k = pd.Series(slopes[:, k], index=idx)
+        offset_k = pd.Series(offsets[:, k], index=idx)
+        lhs_plus = n.model.linexpr((1, loss), (-slope_k, flow))
+        lhs_minus = n.model.linexpr((1, loss), (slope_k, flow))
+
+        n.model.add_constraints(
+            lhs_plus >= offset_k, name=f"{c}-loss_tangents-{k + 1}-1", mask=active
+        )
+        n.model.add_constraints(
+            lhs_minus >= offset_k, name=f"{c}-loss_tangents-{k + 1}--1", mask=active
+        )

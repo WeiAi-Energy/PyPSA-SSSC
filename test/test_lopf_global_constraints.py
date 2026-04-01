@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-
 import pytest
 
 
@@ -74,3 +73,25 @@ def test_assign_all_duals(ac_dc_network, assign):
 
     assert ("generation_limit" in n.global_constraints.index) == assign
     assert ("mu_generation_limit_dynamic" in n.global_constraints_t) == assign
+
+
+def test_assign_scaled_global_constraint_dual(ac_dc_network):
+    n = ac_dc_network.copy()
+
+    limit = 30_000
+    scale = 1e3
+
+    m = n.optimize.create_model()
+    transmission = m.variables["Link-p"]
+    m.add_constraints(
+        transmission.sum() / scale <= limit / scale,
+        name="GlobalConstraint-generation_limit",
+    )
+    n._global_constraint_scales["generation_limit"] = scale
+
+    n.optimize.solve_model(assign_all_duals=True)
+
+    raw_dual = float(m.constraints["GlobalConstraint-generation_limit"].dual)
+    assert n.global_constraints.at["generation_limit", "mu"] == pytest.approx(
+        raw_dual * scale
+    )

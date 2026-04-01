@@ -167,6 +167,33 @@ def flatten_multiindex(m: pd.MultiIndex, join: str = " ") -> pd.Index:
     return m if m.nlevels <= 1 else m.to_flat_index().str.join(join).str.strip()
 
 
+def _all_float_dtypes(data: pd.DataFrame) -> bool:
+    """Return whether all columns in a DataFrame use floating-point dtypes."""
+    return not data.empty and all(pd.api.types.is_float_dtype(dtype) for dtype in data.dtypes)
+
+
+def _static_pnl_mask(data: pd.DataFrame, static: pd.Series) -> pd.Series:
+    """
+    Identify time series columns whose values are equal to their static attribute.
+
+    Floating-point comparisons use a small tolerance to account for temporary
+    float32 aggregation in clustering.
+    """
+    aligned_static = static.reindex(data.columns)
+
+    if _all_float_dtypes(data) and pd.api.types.is_float_dtype(aligned_static.dtype):
+        values = np.isclose(
+            data.to_numpy(dtype=np.float64, copy=False),
+            aligned_static.to_numpy(dtype=np.float64, copy=False),
+            rtol=1e-6,
+            atol=1e-7,
+            equal_nan=True,
+        )
+        return pd.Series(values.all(axis=0), index=data.columns)
+
+    return (data == aligned_static).all()
+
+
 def aggregateoneport(
     n: Network,
     busmap: dict,
@@ -229,8 +256,10 @@ def aggregateoneport(
         capacity_weights = (
             df[capacity[0]].groupby(grouper, axis=0).transform(normed_or_uniform)
         )
+        capacity_weights_f32 = capacity_weights.astype(np.float32)
     if "weight" in df.columns:
         weights = df.weight.groupby(grouper, axis=0).transform(normed_or_uniform)
+        weights_f32 = weights.astype(np.float32)
 
     for k, v in static_strategies.items():
         if v == "weighted_average":
@@ -263,17 +292,22 @@ def aggregateoneport(
             data = n.get_switchable_as_dense(c, attr)
             aggregated = data.loc[:, to_aggregate]
 
+            if _all_float_dtypes(aggregated):
+                aggregated = aggregated.astype(np.float32, copy=False)
+
             if strategy == "weighted_average":
-                aggregated = aggregated * weights
+                aggregated = aggregated.mul(weights_f32, axis=1)
                 aggregated = aggregated.T.groupby(grouper).sum().T
             elif strategy == "capacity_weighted_average":
-                aggregated = aggregated * capacity_weights
+                aggregated = aggregated.mul(capacity_weights_f32, axis=1)
                 aggregated = aggregated.T.groupby(grouper).sum().T
             elif strategy == "weighted_min":
-                aggregated = aggregated / weights
+                aggregated = aggregated.div(weights_f32, axis=1)
                 aggregated = aggregated.T.groupby(grouper).min().T
             else:
                 aggregated = aggregated.T.groupby(grouper).agg(strategy).T
+            if _all_float_dtypes(aggregated):
+                aggregated = aggregated.astype(np.float64, copy=False)
             aggregated.columns = flatten_multiindex(aggregated.columns).rename(c)
 
             non_aggregated = data.loc[:, ~to_aggregate]
@@ -282,7 +316,7 @@ def aggregateoneport(
 
             # filter out static values
             if attr in df:
-                is_static = (pnl[attr] == df[attr]).all()
+                is_static = _static_pnl_mask(pnl[attr], df[attr])
                 pnl[attr] = pnl[attr].loc[:, ~is_static]
 
     return df, pnl

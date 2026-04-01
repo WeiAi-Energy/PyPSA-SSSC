@@ -116,31 +116,32 @@ def plot(
         If set to true, the upper half circle per bus then includes all positive values
         of the series, the lower half circle all negative values. Defaults to False.
     line_colors : str/pandas.Series
-        Colors for the lines, defaults to 'rosybrown'.
+        Colors for the lines and LineX assets, defaults to 'rosybrown'.
     link_colors : str/pandas.Series
         Colors for the links, defaults to 'darkseagreen'.
     transfomer_colors : str/pandas.Series
         Colors for the transfomer, defaults to 'orange'.
     line_alpha : str/pandas.Series
-        Alpha for the lines, defaults to 1.
+        Alpha for the lines and LineX assets, defaults to 1.
     link_alpha : str/pandas.Series
         Alpha for the links, defaults to 1.
     transfomer_alpha : str/pandas.Series
         Alpha for the transfomer, defaults to 1.
     line_widths : dict/pandas.Series
-        Widths of lines, defaults to 1.5
+        Widths of lines and LineX assets, defaults to 1.5
     link_widths : dict/pandas.Series
         Widths of links, defaults to 1.5
     transformer_widths : dict/pandas.Series
         Widths of transformer, defaults to 1.5
     line_cmap : plt.cm.ColorMap/str|dict
-        If line_colors are floats, this color map will assign the colors.
+        If line_colors are floats, this color map will assign the colors for
+        lines and LineX assets.
     link_cmap : plt.cm.ColorMap/str|dict
         If link_colors are floats, this color map will assign the colors.
     transformer_cmap : plt.cm.ColorMap/str|dict
         If transformer_colors are floats, this color map will assign the colors.
     line_norm : plt.Normalize|matplotlib.colors.*Norm
-        The norm applied to the line_cmap.
+        The norm applied to the line_cmap for lines and LineX assets.
     link_norm : plt.Normalize|matplotlib.colors.*Norm
         The norm applied to the link_cmap.
     transformer_norm : matplotlib.colors.Normalize|matplotlib.colors.*Norm
@@ -164,7 +165,8 @@ def plot(
     boundaries : list of four floats
         Boundaries of the plot in format [x1, x2, y1, y2]
     branch_components : list of str
-        Branch components to be plotted, defaults to Line and Link.
+        Branch components to be plotted, defaults to all present branch
+        components.
     jitter : None|float
         Amount of random noise to add to bus positions to distinguish
         overlapping buses
@@ -351,26 +353,31 @@ def plot(
 
     branch_colors = {
         "Line": line_colors,
+        "LineX": line_colors,
         "Link": link_colors,
         "Transformer": transformer_colors,
     }
     branch_alpha = {
         "Line": line_alpha,
+        "LineX": line_alpha,
         "Link": link_alpha,
         "Transformer": transformer_alpha,
     }
     branch_widths = {
         "Line": line_widths,
+        "LineX": line_widths,
         "Link": link_widths,
         "Transformer": transformer_widths,
     }
     branch_cmap = {
         "Line": line_cmap,
+        "LineX": line_cmap,
         "Link": link_cmap,
         "Transformer": transformer_cmap,
     }
     branch_norm = {
         "Line": line_norm,
+        "LineX": line_norm,
         "Link": link_norm,
         "Transformer": transformer_norm,
     }
@@ -391,11 +398,7 @@ def plot(
         if flow is not None and flow.get(c.name) is not None:
             d["flow"] = flow[c.name]
 
-        if any([isinstance(v, pd.Series) for _, v in d.items()]):
-            df = pd.DataFrame(d)
-        else:
-            df = pd.DataFrame(d, index=c.df.index)
-
+        df = as_branch_frame(d, c.name, n)
         if df.empty:
             continue
 
@@ -474,13 +477,13 @@ def plot(
     return (bus_collection,) + tuple(branch_collections) + tuple(arrow_collections)
 
 
-def as_branch_series(ser, arg, c, n):
-    ser = pd.Series(ser, index=n.df(c).index)
-    if ser.isnull().any():
-        msg = f"{c}_{arg}s does not specify all "
-        f"entries. Missing values for {c}: {list(ser[ser.isnull()].index)}"
-        raise ValueError(msg)
-    return ser
+def as_branch_frame(data, c, n):
+    if any(isinstance(v, pd.Series) for v in data.values()):
+        df = pd.DataFrame(data)
+    else:
+        df = pd.DataFrame(data, index=n.df(c).index)
+
+    return df.reindex(n.df(c).index.intersection(df.index)).dropna(how="any")
 
 
 def get_projection_from_crs(crs):
@@ -1003,19 +1006,19 @@ def iplot(
     bus_text : pandas.Series
         Text for each bus, defaults to bus names
     line_colors : str/pandas.Series
-        Colors for the lines, defaults to 'rosybrown'.
+        Colors for the lines and LineX assets, defaults to 'rosybrown'.
     link_colors : str/pandas.Series
         Colors for the links, defaults to 'darkseagreen'.
     transfomer_colors : str/pandas.Series
         Colors for the transfomer, defaults to 'orange'.
     line_widths : dict/pandas.Series
-        Widths of lines, defaults to 1.5
+        Widths of lines and LineX assets, defaults to 1.5
     link_widths : dict/pandas.Series
         Widths of links, defaults to 1.5
     transformer_widths : dict/pandas.Series
         Widths of transformer, defaults to 1.5
     line_text : pandas.Series
-        Text for lines, defaults to line names.
+        Text for lines and LineX assets, defaults to branch names.
     link_text : pandas.Series
         Text for links, defaults to link names.
     tranformer_text : pandas.Series
@@ -1030,7 +1033,8 @@ def iplot(
     size : None|tuple
         Tuple specifying width and height of figure; e.g. (width, heigh).
     branch_components : list of str
-        Branch components to be plotted, defaults to Line and Link.
+        Branch components to be plotted, defaults to all present branch
+        components.
     iplot : bool, default True
         Automatically do an interactive plot of the figure.
     jitter : None|float
@@ -1119,16 +1123,19 @@ def iplot(
 
     branch_colors = {
         "Line": line_colors,
+        "LineX": line_colors,
         "Link": link_colors,
         "Transformer": transformer_colors,
     }
     branch_widths = {
         "Line": line_widths,
+        "LineX": line_widths,
         "Link": link_widths,
         "Transformer": transformer_widths,
     }
     branch_text = {
         "Line": line_text,
+        "LineX": line_text,
         "Link": link_text,
         "Transformer": transformer_text,
     }
@@ -1137,19 +1144,27 @@ def iplot(
     shape_traces = []
 
     for c in n.iterate_components(branch_components):
-        b_widths = as_branch_series(branch_widths[c.name], "width", c.name, n)
-        b_colors = as_branch_series(branch_colors[c.name], "color", c.name, n)
-        b_text = branch_text[c.name]
+        d = dict(width=branch_widths[c.name], color=branch_colors[c.name])
+        if branch_text[c.name] is not None:
+            d["text"] = branch_text[c.name]
+
+        df = as_branch_frame(d, c.name, n)
+        if df.empty:
+            continue
+
+        b_widths = df.width
+        b_colors = df.color
+        b_text = df.get("text")
 
         if b_text is None:
-            b_text = c.name + " " + c.df.index
+            b_text = c.name + " " + df.index
 
-        x0 = c.df.bus0.map(x)
-        x1 = c.df.bus1.map(x)
-        y0 = c.df.bus0.map(y)
-        y1 = c.df.bus1.map(y)
+        x0 = c.df.bus0[df.index].map(x)
+        x1 = c.df.bus1[df.index].map(x)
+        y0 = c.df.bus0[df.index].map(y)
+        y1 = c.df.bus1[df.index].map(y)
 
-        for b in c.df.index:
+        for b in df.index:
             shapes.append(
                 dict(
                     type="line",
