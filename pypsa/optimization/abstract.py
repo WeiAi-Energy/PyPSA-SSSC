@@ -144,41 +144,30 @@ def optimize_transmission_expansion_iteratively(
             if not typed_i.empty:
                 df.loc[typed_i, "num_parallel"] = target[typed_i] / data["base_s_nom"][typed_i]
 
-    def collect_branch_bounds(network: Network) -> tuple[pd.Series, pd.Series]:
-        lower = {}
-        upper = {}
-        for c in branch_components:
-            df = network.df(c)
-            lower_bounds = pd.Series(0.0, index=df.index, dtype=float)
-            upper_bounds = pd.Series(np.inf, index=df.index, dtype=float)
-            ext_i = branch_data[c]["ext_i"]
-            if f"{nominal_attrs[c]}_min" in df:
-                lower_bounds.loc[ext_i] = (
-                    df[f"{nominal_attrs[c]}_min"].reindex(ext_i).fillna(0.0)
-                )
-            if f"{nominal_attrs[c]}_max" in df:
-                upper_bounds.loc[ext_i] = (
-                    df[f"{nominal_attrs[c]}_max"].reindex(ext_i).fillna(np.inf)
-                )
-            fixed_i = df.index.difference(ext_i)
-            if not fixed_i.empty:
-                nominal = df[nominal_attrs[c]].reindex(fixed_i)
-                lower_bounds.loc[fixed_i] = nominal
-                upper_bounds.loc[fixed_i] = nominal
-            lower[c] = lower_bounds
-            upper[c] = upper_bounds
-        return (
-            pd.concat(lower, names=["component", "name"]),
-            pd.concat(upper, names=["component", "name"]),
-        )
-
-    def clip_branch_caps(
-        caps: pd.Series, lower: pd.Series, upper: pd.Series
-    ) -> pd.Series:
+    def clip_branch_caps(caps: pd.Series) -> pd.Series:
         clipped = caps.copy()
-        lower_aligned = lower.reindex(clipped.index).fillna(-np.inf)
-        upper_aligned = upper.reindex(clipped.index).fillna(np.inf)
-        return clipped.clip(lower=lower_aligned, upper=upper_aligned)
+        for c in branch_components:
+            ext_i = branch_data[c]["ext_i"]
+            if ext_i.empty:
+                continue
+
+            df = n.df(c)
+            idx = pd.MultiIndex.from_product(
+                [[c], ext_i], names=["component", "name"]
+            )
+            lower = (
+                df.loc[ext_i, f"{nominal_attrs[c]}_min"]
+                .set_axis(idx)
+                .fillna(0.0)
+            )
+            upper = (
+                df.loc[ext_i, f"{nominal_attrs[c]}_max"]
+                .set_axis(idx)
+                .fillna(np.inf)
+            )
+            clipped.loc[idx] = clipped.loc[idx].clip(lower=lower, upper=upper)
+
+        return clipped
 
     def save_optimal_capacities(network: Network, iteration: int, status: str) -> None:
         for c, attr in pd.Series(nominal_attrs)[list(network.branch_components)].items():
@@ -224,7 +213,6 @@ def optimize_transmission_expansion_iteratively(
         if "LineX" in n.components and not n.line_xs.empty:
             n.line_xs["sssc_nom_opt_0"] = n.line_xs["sssc_nom"]
 
-    branch_cap_min, branch_cap_max = collect_branch_bounds(n)
     current_def = collect_branch_caps("s_nom")
     initial_caps = current_def.copy()
     iteration = 1
@@ -253,9 +241,7 @@ def optimize_transmission_expansion_iteratively(
             save_optimal_capacities(n, iteration, status)
 
         if diff < msq_threshold and iteration >= min_iterations:
-            current_def = clip_branch_caps(
-                optimized_caps.copy(), branch_cap_min, branch_cap_max
-            )
+            current_def = clip_branch_caps(optimized_caps.copy())
             break
 
         next_def = optimized_caps.copy()
@@ -263,9 +249,7 @@ def optimize_transmission_expansion_iteratively(
             current_def = next_def
         else:
             current_def = relax_iterate(current_def, next_def)
-            current_def = clip_branch_caps(
-                current_def, branch_cap_min, branch_cap_max
-            )
+            current_def = clip_branch_caps(current_def)
         logger.info("Iteration %s: using relaxation step.", iteration)
 
         iteration += 1
