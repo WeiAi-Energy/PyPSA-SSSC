@@ -753,7 +753,6 @@ def define_line_x_sssc_constraints(n: Network, sns: pd.Index) -> None:
     m.add_constraints(q_ext - sssc <= 0, name=f"{c}-ext-q_sssc-upper", mask=active)
     m.add_constraints(q_ext + sssc >= 0, name=f"{c}-ext-q_sssc-lower", mask=active)
 
-
 def define_fixed_nominal_constraints(n: Network, c: str, attr: str) -> None:
     """
     Sets constraints for fixing static variables of a given component and

@@ -9,11 +9,9 @@ from __future__ import annotations
 import copy
 import gc
 import logging
-import re
 from collections.abc import Sequence
 from itertools import product
 from typing import TYPE_CHECKING, Any
-
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -27,24 +25,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-RTEP_INNER_EQUIVALENT_CARRIER = "__rtep_inner_equivalent__"
-RTEP_INNER_LOAD_SUFFIX = "__rtep_inner_load"
-RTEP_INNER_MAX_ITERATIONS = 5
-RTEP_INNER_INJECTION_ZERO_THRESHOLD = 1e-2
-RTEP_INNER_FIXED_LOSS_ZERO_THRESHOLD = 1e-2
-
-
 def optimize_transmission_expansion_iteratively(
     n: Network,
     snapshots: Sequence | None = None,
-    outer_msq_threshold: float = 0.01,
+    msq_threshold: float = 0.001,
     min_iterations: int = 1,
     max_iterations: int = 100,
     track_iterations: bool = False,
-    line_unit_size: float | None = None,
-    link_unit_size: dict | None = None,
-    line_threshold: float | None = None,
-    link_threshold: dict | None = None,
+    relaxation_factor: float = 1.0,
     **kwargs: Any,
 ) -> tuple[str, str]:
     """
@@ -59,31 +47,28 @@ def optimize_transmission_expansion_iteratively(
     snapshots : list or index slice
         A list of snapshots to optimise, must be a subset of
         network.snapshots, defaults to network.snapshots
-    outer_msq_threshold: float, default 0.03
-        Maximal mean square difference between optimized line capacity of
-        the current and the previous outer iteration. As soon as this threshold is
-        undercut, and the number of iterations is bigger than 'min_iterations'
-        the outer iterative optimization stops
+    msq_threshold: float, default 0.03
+        Maximal relative fixed-point residual between the current defining
+        transmission capacities given to the network and the optimized
+        transmission capacities returned by the current iteration. As
+        soon as this threshold is undercut, and the number of iterations is
+        bigger than 'min_iterations', the iterative optimization stops.
     min_iterations : integer, default 1
-        Minimal number of iteration to run regardless whether the outer_msq_threshold
+        Minimal number of iteration to run regardless whether the msq_threshold
         is already undercut
     max_iterations : integer, default 100
-        Maximal number of iterations to run regardless whether outer_msq_threshold
+        Maximal number of iterations to run regardless whether msq_threshold
         is already undercut
     track_iterations: bool, default False
         If True, the intermediate branch capacities and values of the
         objective function are recorded for each iteration. The values of
         iteration 0 represent the initial state.
-    line_unit_size: float, default None
-        The unit size for line components.
-        Use None if no discretization is desired.
-    link_unit_size: dict-like, default None
-        A dictionary containing the unit sizes for link components,
-        with carrier names as keys. Use None if no discretization is desired.
-    line_threshold: float, default 0.3
-        The threshold relative to the unit size for discretizing line components.
-    link_threshold: dict-like, default 0.3 per carrier
-        The threshold relative to the unit size for discretizing link components.
+    relaxation_factor : float, default 1.0
+        Convex relaxation factor applied to the next iterate. A value of
+        ``1.0`` keeps the current behavior, values in ``[0, 1)`` blend the
+        new iterate with the previous one, and values greater than ``1.0``
+        apply over-relaxation. Relaxation is applied from the second
+        update onward.
     **kwargs
         Keyword arguments of the `n.optimize` function which runs at each iteration
     """
@@ -93,7 +78,8 @@ def optimize_transmission_expansion_iteratively(
 
     branch_components = [c for c in ("Line", "LineX") if c in n.components and not n.df(c).empty]
     if not branch_components:
-        return n.optimize(snapshots, **kwargs)
+        status, condition = n.optimize(snapshots, **kwargs)
+        return status, condition
 
     for c in branch_components:
         n.df(c)["carrier"] = n.df(c).bus0.map(n.buses.carrier)
@@ -126,138 +112,13 @@ def optimize_transmission_expansion_iteratively(
             names=["component", "name"],
         )
 
-    def parse_constraint_carriers(value: Any) -> list[str]:
-        if pd.isna(value):
-            return []
-        return [
-            re.sub(r"[\[\]\(\)]", "", carrier.strip())
-            for carrier in str(value).split(",")
-            if carrier.strip()
-        ]
-
-    def get_branch_caps_for_reporting(
-        network: Network, component: str, branch_caps: pd.Series
-    ) -> pd.Series:
-        df = network.df(component)
-        try:
-            caps = branch_caps.xs(component, level="component")
-        except (KeyError, ValueError):
-            return pd.Series(index=df.index, dtype=float)
-        return caps.reindex(df.index)
-
-    def report_inner_transmission_budget_usage(
-        base_network: Network,
-        inner_branch_caps: pd.Series,
-        outer_iteration: int,
-        inner_iteration: int,
-    ) -> None:
-        if base_network.global_constraints.empty:
-            return
-
-        period_weighting = None
-        if base_network._multi_invest and isinstance(snapshots, pd.MultiIndex):
-            periods = snapshots.unique("period")
-            period_weighting = base_network.investment_period_weightings.objective[
-                periods
-            ]
-
-        for name, glc in base_network.global_constraints.iterrows():
-            if glc.type not in {
-                "transmission_expansion_cost_limit",
-                "transmission_volume_expansion_limit",
-            }:
-                continue
-
-            carriers = parse_constraint_carriers(glc.carrier_attribute)
-            period = glc.investment_period
-            implied = 0.0
-
-            def filter_active_assets(
-                component: str, index: pd.Index
-            ) -> tuple[pd.Index, int | pd.Series]:
-                if index.empty:
-                    return index, 1
-
-                if not pd.isna(period):
-                    index = index[base_network.get_active_assets(component, period)[index]]
-                    return index, 1
-
-                if isinstance(snapshots, pd.MultiIndex):
-                    index = index[
-                        base_network.get_active_assets(component, snapshots.unique("period"))[
-                            index
-                        ]
-                    ]
-                    if (
-                        glc.type == "transmission_expansion_cost_limit"
-                        and period_weighting is not None
-                    ):
-                        active = pd.concat(
-                            {
-                                current_period: base_network.get_active_assets(
-                                    component, current_period
-                                )[index]
-                                for current_period in snapshots.unique("period")
-                            },
-                            axis=1,
-                        )
-                        return index, active @ period_weighting
-
-                return index, 1
-
-            for c in ["Line", "LineX", "Link"]:
-                if c not in nominal_attrs or c not in base_network.components:
-                    continue
-
-                df = base_network.df(c)
-                if df.empty:
-                    continue
-
-                ext_i = base_network.get_extendable_i(c)
-                if ext_i.empty or "carrier" not in df.columns:
-                    continue
-
-                ext_i = ext_i.intersection(df.query("carrier in @carriers").index)
-                ext_i, weights = filter_active_assets(c, ext_i)
-
-                if ext_i.empty:
-                    continue
-
-                if c == "Link":
-                    attr = nominal_attrs[c]
-                    caps = (
-                        df.get(f"{attr}_opt", df[attr])
-                        .reindex(ext_i)
-                        .fillna(df[attr].reindex(ext_i))
-                    )
-                else:
-                    caps = get_branch_caps_for_reporting(base_network, c, inner_branch_caps)
-                    caps = caps.reindex(ext_i).fillna(df[nominal_attrs[c]].reindex(ext_i))
-
-                if glc.type == "transmission_expansion_cost_limit":
-                    coeff = df.capital_cost.reindex(ext_i)
-                    implied += float((coeff * caps * weights).sum())
-                else:
-                    coeff = df.length.reindex(ext_i)
-                    implied += float((coeff * caps).sum())
-
-            budget = float(glc.constant)
-            ratio = np.nan if abs(budget) < 1e-12 else implied / budget
-            logger.info(
-                "RTEP inner iteration %s.%s: %s (%s) implied=%#.6g budget=%#.6g ratio=%s",
-                outer_iteration,
-                inner_iteration,
-                name,
-                glc.type,
-                implied,
-                budget,
-                "nan" if np.isnan(ratio) else f"{ratio:.3e}",
-            )
-
     ext_branches = pd.MultiIndex.from_tuples(
         [(c, i) for c in branch_components for i in branch_data[c]["ext_i"]],
         names=["component", "name"],
     )
+    relaxation_factor = float(relaxation_factor)
+    if not np.isfinite(relaxation_factor) or relaxation_factor < 0.0:
+        raise ValueError("relaxation_factor must be finite and >= 0.")
 
     def update_line_params(network: Network, s_nom_define: pd.Series) -> None:
         """
@@ -283,6 +144,42 @@ def optimize_transmission_expansion_iteratively(
             if not typed_i.empty:
                 df.loc[typed_i, "num_parallel"] = target[typed_i] / data["base_s_nom"][typed_i]
 
+    def collect_branch_bounds(network: Network) -> tuple[pd.Series, pd.Series]:
+        lower = {}
+        upper = {}
+        for c in branch_components:
+            df = network.df(c)
+            lower_bounds = pd.Series(0.0, index=df.index, dtype=float)
+            upper_bounds = pd.Series(np.inf, index=df.index, dtype=float)
+            ext_i = branch_data[c]["ext_i"]
+            if f"{nominal_attrs[c]}_min" in df:
+                lower_bounds.loc[ext_i] = (
+                    df[f"{nominal_attrs[c]}_min"].reindex(ext_i).fillna(0.0)
+                )
+            if f"{nominal_attrs[c]}_max" in df:
+                upper_bounds.loc[ext_i] = (
+                    df[f"{nominal_attrs[c]}_max"].reindex(ext_i).fillna(np.inf)
+                )
+            fixed_i = df.index.difference(ext_i)
+            if not fixed_i.empty:
+                nominal = df[nominal_attrs[c]].reindex(fixed_i)
+                lower_bounds.loc[fixed_i] = nominal
+                upper_bounds.loc[fixed_i] = nominal
+            lower[c] = lower_bounds
+            upper[c] = upper_bounds
+        return (
+            pd.concat(lower, names=["component", "name"]),
+            pd.concat(upper, names=["component", "name"]),
+        )
+
+    def clip_branch_caps(
+        caps: pd.Series, lower: pd.Series, upper: pd.Series
+    ) -> pd.Series:
+        clipped = caps.copy()
+        lower_aligned = lower.reindex(clipped.index).fillna(-np.inf)
+        upper_aligned = upper.reindex(clipped.index).fillna(np.inf)
+        return clipped.clip(lower=lower_aligned, upper=upper_aligned)
+
     def save_optimal_capacities(network: Network, iteration: int, status: str) -> None:
         for c, attr in pd.Series(nominal_attrs)[list(network.branch_components)].items():
             network.df(c)[f"{attr}_opt_{iteration}"] = network.df(c)[f"{attr}_opt"]
@@ -295,40 +192,12 @@ def optimize_transmission_expansion_iteratively(
             columns={"mu": f"mu_{iteration}"}
         )
 
-    def discretized_capacity(nom_opt, unit_size, threshold, min_units=0):
-        units = nom_opt // unit_size + (nom_opt % unit_size >= threshold * unit_size)
-        return max(min_units, units) * unit_size
-
-    def discretize_branch_components(
-        network: Network,
-        line_unit_size: float | None,
-        link_unit_size: dict | None,
-        line_threshold: float | None,
-        link_threshold: dict | None,
-    ) -> None:
-        line_threshold = line_threshold or 0.3
-        link_threshold = link_threshold or {}
-
-        if line_unit_size:
-            min_units = 1
-            for c in branch_components:
-                network.df(c)["s_nom"] = network.df(c)["s_nom_opt"].apply(
-                    discretized_capacity,
-                    args=(line_unit_size, line_threshold, min_units),
-                )
-
-        if link_unit_size:
-            for carrier in link_unit_size.keys() & set(network.links.carrier.unique()):
-                sel = network.links.carrier == carrier
-                network.links.loc[sel, "p_nom"] = network.links.loc[sel, "p_nom_opt"].apply(
-                    discretized_capacity,
-                    args=(link_unit_size[carrier], link_threshold.get(carrier, 0.3)),
-                )
-
-    def relative_capacity_change(current: pd.Series, previous: pd.Series) -> float:
+    def relative_capacity_change(
+        current: pd.Series, previous: pd.Series, initial: pd.Series
+    ) -> float:
         if ext_branches.empty:
             return 0.0
-        denom = np.linalg.norm(previous.loc[ext_branches].to_numpy())
+        denom = np.linalg.norm(initial.loc[ext_branches].to_numpy())
         denom = max(denom, 1e-12)
         return float(
             np.linalg.norm(
@@ -337,448 +206,27 @@ def optimize_transmission_expansion_iteratively(
             / denom
         )
 
-    def sanitize_solver_kwargs(solve_kwargs: dict[str, Any]) -> dict[str, Any]:
-        """
-        Copy solver kwargs without altering user-provided solver tolerances.
-        """
-        clean_kwargs = dict(solve_kwargs)
-        solver_options = clean_kwargs.get("solver_options")
-        if isinstance(solver_options, dict):
-            clean_kwargs["solver_options"] = dict(solver_options)
+    def relax_iterate(current: pd.Series, target: pd.Series) -> pd.Series:
+        if relaxation_factor == 1.0:
+            return target.copy()
+        aligned_target = target.reindex(current.index)
+        return current + relaxation_factor * (aligned_target - current)
 
-        return clean_kwargs
-
-    def sanitize_inner_solver_kwargs(solve_kwargs: dict[str, Any]) -> dict[str, Any]:
-        """
-        Remove workflow-specific solver tweaks that should not be enforced in the
-        simplified inner RTEP solves.
-        """
-        clean_kwargs = sanitize_solver_kwargs(solve_kwargs)
-
-        solver_options = clean_kwargs.get("solver_options")
-        if isinstance(solver_options, dict):
-            solver_options = dict(solver_options)
-        else:
-            solver_options = {}
-
-        solver_name = str(clean_kwargs.get("solver_name", "highs")).lower()
-        if solver_name == "gurobi":
-            solver_options["crossover"] = 1
-            # solver_options["BarHomogeneous"] = 1
-
-        clean_kwargs["solver_options"] = solver_options
-
-        return clean_kwargs
-
-    def inherit_missing_network_attrs(source: Network, target: Network) -> None:
-        """
-        Preserve user-defined runtime attributes on selectively copied networks.
-        """
-        for attr, value in source.__dict__.items():
-            if attr == "model" or attr in target.__dict__:
-                continue
-            try:
-                setattr(target, attr, copy.deepcopy(value))
-            except Exception:
-                setattr(target, attr, value)
-
-    def disable_inner_only_runtime_features(network: Network) -> None:
-        """
-        Disable workflow-specific features that should not be active in the
-        simplified inner RTEP subproblem.
-        """
-        config = getattr(network, "config", None)
-        if not isinstance(config, dict):
-            return
-
-        rep_cfg = (
-            config.get("clustering", {})
-            .get("temporal", {})
-            .get("representative_periods", {})
-        )
-        if isinstance(rep_cfg, dict) and rep_cfg.get("enable", False):
-            rep_cfg["enable"] = False
-            logger.info(
-                "Disabled representative periods for the inner RTEP optimization."
-            )
-
-    def normalize_empty_component_indices(network: Network) -> None:
-        """
-        Keep empty component indices string-typed so external workflow hooks
-        using `.index.str` on empty tables do not fail.
-        """
-        for c in network.all_components:
-            df = network.df(c)
-            if not df.empty:
-                continue
-            df.index = pd.Index([], dtype=object, name=df.index.name or c)
-
-    def collect_outer_branch_losses(base_network: Network) -> dict[str, pd.DataFrame]:
-        """
-        Read the outer-loop passive branch losses that should be kept fixed in
-        the inner RTEP subproblem.
-        """
-        if not hasattr(base_network, "model"):
-            return {}
-
-        losses: dict[str, pd.DataFrame] = {}
-        for c in branch_components:
-            name = f"{c}-loss"
-            if name not in base_network.model.variables:
-                continue
-
-            loss = (
-                base_network.model[name]
-                .solution.to_pandas()
-                .reindex(index=snapshots, columns=base_network.df(c).index, fill_value=0.0)
-                .clip(lower=0.0)
-            )
-            losses[c] = loss
-
-        return losses
-
-    def prepare_rtep_network(
-        base_network: Network,
-        s_nom_define: pd.Series,
-        outer_branch_losses: dict[str, pd.DataFrame],
-    ) -> Network:
-        override_components, override_component_attrs = (
-            base_network._retrieve_overridden_components()
-        )
-        rtep_n = base_network.__class__(
-            override_components=override_components,
-            override_component_attrs=override_component_attrs,
-        )
-        rtep_n.set_snapshots(base_network.snapshots)
-        rtep_n._snapshot_weightings = base_network.snapshot_weightings.copy()
-        rtep_n._investment_periods = base_network.investment_periods.copy()
-        rtep_n._investment_period_weightings = (
-            base_network.investment_period_weightings.copy()
-        )
-        inherit_missing_network_attrs(base_network, rtep_n)
-        disable_inner_only_runtime_features(rtep_n)
-        normalize_empty_component_indices(rtep_n)
-
-        if not base_network.carriers.empty:
-            rtep_n.import_components_from_dataframe(
-                pd.DataFrame(base_network.carriers), "Carrier"
-            )
-
-        def unique_temp_names(
-            buses: pd.Index, existing: pd.Index, suffix: str
-        ) -> pd.Index:
-            names = []
-            used = set(existing.astype(str))
-            for bus in buses.astype(str):
-                candidate = f"{bus}{suffix}"
-                counter = 1
-                while candidate in used:
-                    candidate = f"{bus}{suffix}_{counter}"
-                    counter += 1
-                used.add(candidate)
-                names.append(candidate)
-            return pd.Index(names)
-
-        keep_components = {"Line", "LineX"}
-        explicit_ac_buses = base_network.buses.index[
-            base_network.buses.carrier.fillna("") == "AC"
-        ]
-        ac_buses = explicit_ac_buses.copy()
-        if ac_buses.empty:
-            ac_buses = pd.Index([], dtype=object)
-            for c in keep_components:
-                if c not in base_network.components or base_network.df(c).empty:
-                    continue
-                branch_i = base_network.df(c).index
-                if "carrier" in base_network.df(c):
-                    carrier = base_network.df(c).carrier.fillna("")
-                    branch_i = branch_i.intersection(carrier[carrier != "DC"].index)
-                if branch_i.empty:
-                    continue
-                ac_buses = ac_buses.union(base_network.df(c).loc[branch_i, "bus0"])
-                ac_buses = ac_buses.union(base_network.df(c).loc[branch_i, "bus1"])
-
-        if ac_buses.empty:
-            return rtep_n
-
-        bus_df = pd.DataFrame(base_network.buses.loc[ac_buses]).assign(sub_network="")
-        rtep_n.import_components_from_dataframe(bus_df, "Bus")
-        allocated_bus_losses = pd.DataFrame(0.0, index=snapshots, columns=ac_buses)
-        fixed_branch_losses: dict[str, pd.DataFrame] = {}
-
-        if "Line" in keep_components and not base_network.lines.empty:
-            line_type_i = (
-                base_network.lines.loc[lambda df: df.bus0.isin(ac_buses) & df.bus1.isin(ac_buses), "type"]
-                .mask(lambda s: s.eq(""))
-                .dropna()
-                .unique()
-            )
-            if len(line_type_i):
-                rtep_n.import_components_from_dataframe(
-                    pd.DataFrame(base_network.line_types.loc[line_type_i]), "LineType"
-                )
-
-        for c in keep_components:
-            if c not in base_network.components or base_network.df(c).empty:
-                continue
-
-            keep_i = base_network.df(c).index
-            if "carrier" in base_network.df(c):
-                carrier = base_network.df(c).carrier.fillna("")
-                keep_i = keep_i.intersection(carrier[carrier != "DC"].index)
-
-            buses0 = base_network.df(c).bus0.reindex(keep_i).isin(ac_buses)
-            buses1 = base_network.df(c).bus1.reindex(keep_i).isin(ac_buses)
-            keep_i = keep_i[buses0 & buses1]
-            if keep_i.empty:
-                continue
-
-            rtep_n.import_components_from_dataframe(
-                pd.DataFrame(base_network.df(c).loc[keep_i]), c
-            )
-
-            outer_loss = outer_branch_losses.get(c)
-            if outer_loss is None:
-                continue
-
-            fixed_loss = outer_loss.reindex(
-                index=snapshots, columns=keep_i, fill_value=0.0
-            ).clip(lower=0.0)
-            fixed_loss = fixed_loss.where(
-                fixed_loss >= RTEP_INNER_FIXED_LOSS_ZERO_THRESHOLD, 0.0
-            )
-            fixed_branch_losses[c] = fixed_loss
-
-            branch_bus0 = base_network.df(c).bus0.reindex(keep_i)
-            branch_bus1 = base_network.df(c).bus1.reindex(keep_i)
-            allocated_bus_losses = allocated_bus_losses.add(
-                (0.5 * fixed_loss).rename(columns=branch_bus0).T.groupby(level=0).sum().T,
-                fill_value=0.0,
-            )
-            allocated_bus_losses = allocated_bus_losses.add(
-                (0.5 * fixed_loss).rename(columns=branch_bus1).T.groupby(level=0).sum().T,
-                fill_value=0.0,
-            )
-
-        update_line_params(rtep_n, s_nom_define)
-        rtep_n.determine_network_topology(skip_isolated_buses=False)
-
-        try:
-            net_ac_injection = base_network.buses_t.p.reindex(
-                index=snapshots, columns=ac_buses, fill_value=0.0
-            ).copy()
-        except AttributeError:
-            net_ac_injection = pd.DataFrame(0.0, index=snapshots, columns=ac_buses)
-
-        if not base_network.transformers.empty:
-            trafo_i = base_network.transformers.index[
-                base_network.transformers.bus0.isin(ac_buses)
-                | base_network.transformers.bus1.isin(ac_buses)
-            ]
-            if not trafo_i.empty:
-                trafo_p0 = base_network.transformers_t.p0.reindex(
-                    index=snapshots, columns=trafo_i, fill_value=0.0
-                )
-                trafo_p1 = base_network.transformers_t.p1.reindex(
-                    index=snapshots, columns=trafo_i, fill_value=0.0
-                )
-                if not trafo_p0.empty:
-                    bus0 = base_network.transformers.bus0.reindex(trafo_i)
-                    bus1 = base_network.transformers.bus1.reindex(trafo_i)
-                    net_ac_injection = net_ac_injection.add(
-                        (-trafo_p0).rename(columns=bus0).T.groupby(level=0).sum().T,
-                        fill_value=0.0,
-                    )
-                    net_ac_injection = net_ac_injection.add(
-                        (-trafo_p1).rename(columns=bus1).T.groupby(level=0).sum().T,
-                        fill_value=0.0,
-                    )
-                net_ac_injection = net_ac_injection.reindex(
-                    columns=ac_buses, fill_value=0.0
-                )
-
-        if fixed_branch_losses:
-            net_ac_injection = net_ac_injection.sub(
-                allocated_bus_losses.reindex(
-                    index=snapshots, columns=ac_buses, fill_value=0.0
-                ),
-                fill_value=0.0,
-            )
-
-        injection_balance_records: list[dict[str, Any]] = []
-        if not rtep_n.sub_networks.empty:
-            for sub_network in rtep_n.sub_networks.index:
-                sn_buses = rtep_n.buses.index[rtep_n.buses.sub_network == sub_network]
-                if sn_buses.empty:
-                    continue
-
-                sn_injection = net_ac_injection.reindex(
-                    columns=sn_buses, fill_value=0.0
-                ).copy()
-                sn_injection = sn_injection.where(
-                    sn_injection.abs() >= RTEP_INNER_INJECTION_ZERO_THRESHOLD, 0.0
-                )
-
-                nonzero_mask = sn_injection.ne(0.0)
-                active_bus_count = nonzero_mask.sum(axis=1)
-                residual = sn_injection.sum(axis=1)
-                balancing_share = pd.Series(0.0, index=sn_injection.index, dtype=float)
-                has_active_buses = active_bus_count > 0
-                balancing_share.loc[has_active_buses] = (
-                    residual.loc[has_active_buses]
-                    / active_bus_count.loc[has_active_buses]
-                )
-
-                sn_injection = sn_injection.where(
-                    ~nonzero_mask, sn_injection.sub(balancing_share, axis=0)
-                )
-                net_ac_injection.loc[:, sn_buses] = sn_injection
-
-                injection_balance_records.append(
-                    {
-                        "sub_network": sub_network,
-                        "bus_count": len(sn_buses),
-                        "avg_active_bus_count": float(active_bus_count.mean()),
-                        "avg_share": float(balancing_share.mean()),
-                        "max_abs_share": float(balancing_share.abs().max()),
-                    }
-                )
-                logger.info(
-                    "RTEP inner balanced bus injection for sub-network %s after zeroing |injection| < %.3e (bus_count=%s, avg active buses=%#.6g, avg share=%#.6g, max abs share=%#.6g).",
-                    sub_network,
-                    RTEP_INNER_INJECTION_ZERO_THRESHOLD,
-                    len(sn_buses),
-                    float(active_bus_count.mean()),
-                    float(balancing_share.mean()),
-                    float(balancing_share.abs().max()),
-                )
-
-        if RTEP_INNER_EQUIVALENT_CARRIER not in rtep_n.carriers.index:
-            rtep_n.add("Carrier", RTEP_INNER_EQUIVALENT_CARRIER)
-
-        load_names = unique_temp_names(
-            ac_buses, rtep_n.loads.index, RTEP_INNER_LOAD_SUFFIX
-        )
-
-        load_df = pd.DataFrame(
-            {
-                "bus": ac_buses.to_numpy(),
-                "carrier": RTEP_INNER_EQUIVALENT_CARRIER,
-            },
-            index=load_names,
-        )
-        load_p_set = (-net_ac_injection).copy()
-        load_p_set.columns = load_names
-        rtep_n.import_components_from_dataframe(load_df, "Load")
-        rtep_n.import_series_from_dataframe(load_p_set, "Load", "p_set")
-
-        rtep_n._rtep_inner_injection_balancing = pd.DataFrame(
-            injection_balance_records
-        )
-        rtep_n._rtep_inner_fixed_branch_losses = fixed_branch_losses
-        rtep_n._rtep_inner_losses_accounted_in_bus_injection = bool(
-            fixed_branch_losses
-        )
-
-        return rtep_n
-
-    def log_inner_injection_balancing(
-        network: Network, outer_iteration: int, inner_iteration: int
-    ) -> None:
-        balancing = getattr(network, "_rtep_inner_injection_balancing", None)
-        if not isinstance(balancing, pd.DataFrame) or balancing.empty:
-            return
-
-        for record in balancing.itertuples(index=False):
-            logger.info(
-                "RTEP inner injection balancing %s.%s: sub-network=%s bus_count=%s avg active buses=%#.6g avg share=%#.6g max abs share=%#.6g",
-                outer_iteration,
-                inner_iteration,
-                record.sub_network,
-                record.bus_count,
-                record.avg_active_bus_count,
-                record.avg_share,
-                record.max_abs_share,
-            )
-
-    def run_rtep_inner(
-        base_network: Network,
-        outer_caps: pd.Series,
-        outer_sssc: pd.Series | None,
-        outer_iteration: int,
-        outer_msq: float,
-    ) -> tuple[pd.Series, pd.Series | None]:
-        if ext_branches.empty:
-            return outer_caps, outer_sssc
-
-        s_nom_hat = outer_caps.copy()
-        sssc_hat = outer_sssc.copy() if outer_sssc is not None else None
-        last_status = ("ok", "optimal")
-        adaptive_inner_threshold = outer_msq / 5
+    if relaxation_factor != 1.0:
         logger.info(
-            "RTEP inner loop threshold for outer iteration %s set to %.3e.",
-            outer_iteration,
-            adaptive_inner_threshold,
+            "Applying fixed-point relaxation factor %.3f.",
+            relaxation_factor,
         )
-        outer_branch_losses = collect_outer_branch_losses(base_network)
 
-        for k in range(min(max_iterations, RTEP_INNER_MAX_ITERATIONS)):
-            rtep_n = prepare_rtep_network(
-                base_network, s_nom_hat, outer_branch_losses
-            )
-            inner_kwargs = sanitize_inner_solver_kwargs(solve_kwargs)
-            inner_kwargs.pop("extra_functionality", None)
-            status, condition = rtep_n.optimize(snapshots, **inner_kwargs)
-            last_status = (status, condition)
-            if status != "ok":
-                logger.warning(
-                    "RTEP inner optimization failed with status %s/%s in outer iteration %s. "
-                    "Using the last outer-loop capacities to start the next outer iteration.",
-                    status,
-                    condition,
-                    outer_iteration,
-                )
-                return outer_caps.copy(), (
-                    outer_sssc.copy() if outer_sssc is not None else None
-                )
-            log_inner_injection_balancing(rtep_n, outer_iteration, k + 1)
-
-            s_nom_tilde = pd.concat(
-                {c: rtep_n.df(c)["s_nom_opt"] for c in branch_components},
-                names=["component", "name"],
-            )
-            if "LineX" in branch_components:
-                sssc_hat = rtep_n.line_xs["sssc_nom_opt"].copy()
-            err = relative_capacity_change(s_nom_tilde, s_nom_hat)
-            logger.info(
-                f"RTEP inner iteration {k + 1}: relative capacity change = {err:.3e}"
-            )
-            report_inner_transmission_budget_usage(
-                base_network, s_nom_tilde, outer_iteration, k + 1
-            )
-            s_nom_hat = s_nom_tilde
-            if err <= adaptive_inner_threshold:
-                break
-
-        logger.info(
-            "RTEP inner loop finished with status %s/%s",
-            last_status[0],
-            last_status[1],
-        )
-        return s_nom_hat, sssc_hat
-
-    if link_threshold is None:
-        link_threshold = {}
-
-    solve_kwargs = sanitize_solver_kwargs(kwargs)
     if track_iterations:
         for c, attr in pd.Series(nominal_attrs)[list(n.branch_components)].items():
             n.df(c)[f"{attr}_opt_0"] = n.df(c)[f"{attr}"]
         if "LineX" in n.components and not n.line_xs.empty:
             n.line_xs["sssc_nom_opt_0"] = n.line_xs["sssc_nom"]
 
+    branch_cap_min, branch_cap_max = collect_branch_bounds(n)
     current_def = collect_branch_caps("s_nom")
-    prev_outer_caps = current_def.copy()
+    initial_caps = current_def.copy()
     iteration = 1
     status = "ok"
     condition = "optimal"
@@ -791,33 +239,35 @@ def optimize_transmission_expansion_iteratively(
             break
 
         update_line_params(n, current_def)
-        status, condition = n.optimize(snapshots, **solve_kwargs)
+        status, condition = n.optimize(snapshots, **kwargs)
         if status != "ok":
             raise RuntimeError(
                 f"Optimization failed with status {status} and termination {condition}"
             )
 
-        outer_caps = collect_branch_caps("s_nom_opt")
-        outer_sssc = (
-            n.line_xs["sssc_nom_opt"].copy() if "LineX" in branch_components else None
-        )
-        diff = relative_capacity_change(outer_caps, prev_outer_caps)
-        logger.info(
-            f"Outer iteration {iteration}: relative capacity change = {diff:.3e}"
-        )
+        optimized_caps = collect_branch_caps("s_nom_opt")
+        diff = relative_capacity_change(optimized_caps, current_def, initial_caps)
+        logger.info("Iteration %s: relative fixed-point residual = %.3e", iteration, diff)
 
         if track_iterations:
             save_optimal_capacities(n, iteration, status)
 
-        if diff < outer_msq_threshold and iteration >= min_iterations:
-            current_def = outer_caps.copy()
+        if diff < msq_threshold and iteration >= min_iterations:
+            current_def = clip_branch_caps(
+                optimized_caps.copy(), branch_cap_min, branch_cap_max
+            )
             break
 
-        current_def, _ = run_rtep_inner(
-            n, outer_caps, outer_sssc, iteration, diff
-        )
+        next_def = optimized_caps.copy()
+        if iteration == 1:
+            current_def = next_def
+        else:
+            current_def = relax_iterate(current_def, next_def)
+            current_def = clip_branch_caps(
+                current_def, branch_cap_min, branch_cap_max
+            )
+        logger.info("Iteration %s: using relaxation step.", iteration)
 
-        prev_outer_caps = outer_caps.copy()
         iteration += 1
 
     if hasattr(n, "model"):
@@ -835,14 +285,14 @@ def optimize_transmission_expansion_iteratively(
     update_line_params(n, current_def)
 
     n.calculate_dependent_values()
-    status, condition = n.optimize(snapshots, **solve_kwargs)
+    status, condition = n.optimize(snapshots, **kwargs)
 
     if status == "ok":
         return status, condition
     else:
         logger.warning(
             "Final rerun with updated transmission parameters failed with status %s/%s. "
-            "Keeping the last successful outer-loop solution.",
+            "Keeping the last successful iterative solution.",
             status,
             condition,
         )

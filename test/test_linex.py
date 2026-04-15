@@ -119,3 +119,4 @@ def test_line_x_iterative_optimization_runs():
     assert condition == "optimal"
     assert "ab" in n.line_xs_t.q_sssc.columns
     assert np.isfinite(n.line_xs.at["ab", "sssc_nom_opt"])
+

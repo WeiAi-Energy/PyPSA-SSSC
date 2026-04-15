@@ -20,6 +20,75 @@ from pypsa.descriptors import nominal_attrs
 logger = logging.getLogger(__name__)
 
 
+def _is_default_carrier_grouping(groupby: Callable | None) -> bool:
+    return groupby is None or groupby is get_carrier
+
+
+def _line_x_carrier_labels(
+    n: Network, nice_names: bool = True, suffix: str = ""
+) -> pd.Series:
+    labels = get_carrier(n, "LineX", nice_names=nice_names)
+    if suffix:
+        labels = labels.astype(str) + suffix
+    return labels
+
+
+def _merge_line_x_component_into_line(df: pd.DataFrame | pd.Series) -> pd.DataFrame | pd.Series:
+    """
+    Merge aggregated LineX rows into Line rows when a component level is present.
+    """
+    if df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    if "component" not in df.index.names:
+        return df
+
+    components = df.index.get_level_values("component")
+    if "LineX" not in components:
+        return df
+
+    frame = df.to_frame("__value__") if isinstance(df, pd.Series) else df.copy()
+    component_pos = frame.index.names.index("component")
+    tuples = []
+    for key in frame.index.tolist():
+        key = list(key)
+        if key[component_pos] == "LineX":
+            key[component_pos] = "Line"
+        tuples.append(tuple(key))
+    frame.index = pd.MultiIndex.from_tuples(tuples, names=frame.index.names)
+    frame = frame.groupby(level=frame.index.names).sum()
+    return frame["__value__"] if isinstance(df, pd.Series) else frame
+
+
+def _append_component_carrier_rows(
+    df: pd.DataFrame | pd.Series,
+    component: str,
+    values: pd.DataFrame | pd.Series,
+) -> pd.DataFrame | pd.Series:
+    """
+    Append rows addressed by (component, carrier) to an aggregated result.
+    """
+    if values.empty:
+        return df
+
+    frame = values.to_frame("__value__") if isinstance(values, pd.Series) else values.copy()
+    if isinstance(df.index, pd.MultiIndex):
+        if df.index.names != ["component", "carrier"]:
+            return df
+        frame.index = pd.MultiIndex.from_arrays(
+            [
+                pd.Index([component] * len(frame), name="component"),
+                pd.Index(frame.index, name="carrier"),
+            ],
+        )
+    else:
+        frame.index = pd.Index(frame.index, name=df.index.name or "carrier")
+
+    if isinstance(df, pd.Series):
+        return pd.concat([df, frame["__value__"]]).groupby(level=df.index.names).sum()
+
+    return pd.concat([df, frame]).groupby(level=df.index.names).sum()
+
+
 def get_carrier(n: Network, c: str, nice_names: bool = True) -> pd.Series:
     """
     Get the nice carrier names for a component.
@@ -445,6 +514,118 @@ class StatisticsAccessor:
             df = df[df != 0]
         return df
 
+    def _aggregate_line_x_sssc_attribute(
+        self,
+        attribute: str,
+        agg: Callable | str | bool = "sum",
+        groupby: Callable | None = None,
+        nice_names: bool | None = True,
+    ) -> pd.DataFrame | pd.Series:
+        """
+        Aggregate a LineX SSSC static attribute for the default carrier grouping.
+        """
+        n = self._parent
+        if "LineX" not in n.all_components or n.df("LineX").empty:
+            return pd.Series([], dtype=float)
+        if not _is_default_carrier_grouping(groupby):
+            return pd.Series([], dtype=float)
+        if nice_names is None:
+            nice_names = self.parameters.nice_names
+
+        @pass_empty_series_if_keyerror
+        def func(n: Network, c: str, port: str) -> pd.Series:
+            return n.df(c).get(attribute, pd.Series(0.0, index=n.df(c).index))
+
+        values = self._aggregate_components(
+            func,
+            agg=agg,
+            comps="LineX",
+            groupby=get_carrier,
+            at_port=False,
+            bus_carrier=None,
+            nice_names=nice_names,
+        )
+        if values.empty:
+            return values
+        frame = values.to_frame("__value__") if isinstance(values, pd.Series) else values.copy()
+        frame.index = pd.Index(frame.index.astype(str) + " SSSC", name="carrier")
+        return frame["__value__"] if isinstance(values, pd.Series) else frame
+
+    def _aggregate_line_x_sssc_expression(
+        self,
+        expr: Callable[[pd.DataFrame], pd.Series],
+        agg: Callable | str | bool = "sum",
+        groupby: Callable | None = None,
+        nice_names: bool | None = True,
+    ) -> pd.DataFrame | pd.Series:
+        """
+        Aggregate a LineX SSSC asset-wise expression for the default carrier grouping.
+        """
+        n = self._parent
+        if "LineX" not in n.all_components or n.df("LineX").empty:
+            return pd.Series([], dtype=float)
+        if not _is_default_carrier_grouping(groupby):
+            return pd.Series([], dtype=float)
+        if nice_names is None:
+            nice_names = self.parameters.nice_names
+
+        @pass_empty_series_if_keyerror
+        def func(n: Network, c: str, port: str) -> pd.Series:
+            return expr(n.df(c))
+
+        values = self._aggregate_components(
+            func,
+            agg=agg,
+            comps="LineX",
+            groupby=get_carrier,
+            at_port=False,
+            bus_carrier=None,
+            nice_names=nice_names,
+        )
+        if values.empty:
+            return values
+        frame = values.to_frame("__value__") if isinstance(values, pd.Series) else values.copy()
+        frame.index = pd.Index(frame.index.astype(str) + " SSSC", name="carrier")
+        return frame["__value__"] if isinstance(values, pd.Series) else frame
+
+    def _aggregate_line_x_sssc_capacity_factor(
+        self,
+        aggregate_time: str | bool = "mean",
+        aggregate_groups: Callable | str | bool = "sum",
+        groupby: Callable | None = None,
+        nice_names: bool | None = True,
+    ) -> pd.Series:
+        """
+        Aggregate LineX SSSC capacity factors for the default carrier grouping.
+        """
+        n = self._parent
+        if "LineX" not in n.all_components or n.df("LineX").empty:
+            return pd.Series([], dtype=float)
+        if not _is_default_carrier_grouping(groupby):
+            return pd.Series([], dtype=float)
+        if "q_sssc" not in n.pnl("LineX"):
+            return pd.Series([], dtype=float)
+        if nice_names is None:
+            nice_names = self.parameters.nice_names
+
+        q = n.pnl("LineX").q_sssc.abs()
+        weights = get_weightings(n, "LineX")
+        operation = aggregate_timeseries(q, weights, agg=aggregate_time)
+        if isinstance(operation, pd.DataFrame):
+            operation = operation.T.groupby(_line_x_carrier_labels(n, nice_names=nice_names, suffix=" SSSC")).sum().T
+        else:
+            operation = operation.groupby(
+                _line_x_carrier_labels(n, nice_names=nice_names, suffix=" SSSC")
+            ).agg(aggregate_groups)
+
+        capacity = self._aggregate_line_x_sssc_attribute(
+            "sssc_nom_opt",
+            agg=aggregate_groups,
+            groupby=groupby,
+            nice_names=nice_names,
+        )
+        return operation.div(capacity.reindex(operation.index), axis=0)
+
     def __call__(
         self,
         comps: Sequence[str] | str | None = None,
@@ -547,10 +728,7 @@ class StatisticsAccessor:
         def func(n: Network, c: str, port: str) -> pd.Series:
             if c == "LineX" and cost_attribute == "capital_cost":
                 df = n.df(c)
-                return (
-                    df["s_nom_opt"] * df["capital_cost"]
-                    + df["sssc_nom_opt"] * df["capital_cost_sssc"]
-                )
+                return df["s_nom_opt"] * df["capital_cost"]
             col = n.df(c).eval(f"{nominal_attrs[c]}_opt * {cost_attribute}")
             return col
 
@@ -563,6 +741,15 @@ class StatisticsAccessor:
             bus_carrier=bus_carrier,
             nice_names=nice_names,
         )
+        df = _merge_line_x_component_into_line(df)
+        sssc = self._aggregate_line_x_sssc_expression(
+            lambda df: df["sssc_nom_opt"] * df["capital_cost_sssc"],
+            agg=aggregate_groups,
+            groupby=groupby,
+            nice_names=nice_names,
+        )
+        if not sssc.empty and cost_attribute == "capital_cost":
+            df = _append_component_carrier_rows(df, "LineX", sssc)
         df.attrs["name"] = "Capital Expenditure"
         df.attrs["unit"] = "currency"
         return df
@@ -594,10 +781,7 @@ class StatisticsAccessor:
         def func(n: Network, c: str, port: str) -> pd.Series:
             if c == "LineX" and cost_attribute == "capital_cost":
                 df = n.df(c)
-                return (
-                    df["s_nom"] * df["capital_cost"]
-                    + df["sssc_nom"] * df["capital_cost_sssc"]
-                )
+                return df["s_nom"] * df["capital_cost"]
             col = n.df(c).eval(f"{nominal_attrs[c]} * {cost_attribute}")
             return col
 
@@ -610,6 +794,15 @@ class StatisticsAccessor:
             bus_carrier=bus_carrier,
             nice_names=nice_names,
         )
+        df = _merge_line_x_component_into_line(df)
+        sssc = self._aggregate_line_x_sssc_expression(
+            lambda df: df["sssc_nom"] * df["capital_cost_sssc"],
+            agg=aggregate_groups,
+            groupby=groupby,
+            nice_names=nice_names,
+        )
+        if not sssc.empty and cost_attribute == "capital_cost":
+            df = _append_component_carrier_rows(df, "LineX", sssc)
         df.attrs["name"] = "Capital Expenditure Fixed"
         df.attrs["unit"] = "currency"
         return df
@@ -694,7 +887,10 @@ class StatisticsAccessor:
             efficiency = port_efficiency(n, c, port=port)
             if not at_port:
                 efficiency = abs(efficiency)
-            col = n.df(c)[f"{nominal_attrs[c]}_opt"] * efficiency
+            if c == "LineX":
+                col = n.df(c).get(f"{nominal_attrs[c]}_line_opt", n.df(c)[f"{nominal_attrs[c]}_opt"]) * efficiency
+            else:
+                col = n.df(c)[f"{nominal_attrs[c]}_opt"] * efficiency
             if storage and (c == "StorageUnit"):
                 col = col * n.df(c).max_hours
             return col
@@ -708,6 +904,15 @@ class StatisticsAccessor:
             bus_carrier=bus_carrier,
             nice_names=nice_names,
         )
+        df = _merge_line_x_component_into_line(df)
+        sssc = self._aggregate_line_x_sssc_attribute(
+            "sssc_nom_opt",
+            agg=aggregate_groups,
+            groupby=groupby,
+            nice_names=nice_names,
+        )
+        if not sssc.empty:
+            df = _append_component_carrier_rows(df, "LineX", sssc)
         df.attrs["name"] = "Optimal Capacity"
         df.attrs["unit"] = "MW"
         return df
@@ -760,6 +965,15 @@ class StatisticsAccessor:
             bus_carrier=bus_carrier,
             nice_names=nice_names,
         )
+        df = _merge_line_x_component_into_line(df)
+        sssc = self._aggregate_line_x_sssc_attribute(
+            "sssc_nom",
+            agg=aggregate_groups,
+            groupby=groupby,
+            nice_names=nice_names,
+        )
+        if not sssc.empty:
+            df = _append_component_carrier_rows(df, "LineX", sssc)
         df.attrs["name"] = "Installed Capacity"
         df.attrs["unit"] = "MW"
         return df
@@ -854,6 +1068,7 @@ class StatisticsAccessor:
             bus_carrier=bus_carrier,
             nice_names=nice_names,
         )
+        df = _merge_line_x_component_into_line(df)
         df.attrs["name"] = "Operational Expenditure"
         df.attrs["unit"] = "currency"
         return df
@@ -888,6 +1103,7 @@ class StatisticsAccessor:
             nice_names=nice_names,
             kind="supply",
         )
+        df = _merge_line_x_component_into_line(df)
         df.attrs["name"] = "Supply"
         df.attrs["unit"] = "carrier dependent"
         return df
@@ -922,6 +1138,7 @@ class StatisticsAccessor:
             nice_names=nice_names,
             kind="withdrawal",
         )
+        df = _merge_line_x_component_into_line(df)
         df.attrs["name"] = "Withdrawal"
         df.attrs["unit"] = "carrier dependent"
         return df
@@ -975,6 +1192,7 @@ class StatisticsAccessor:
             bus_carrier=bus_carrier,
             nice_names=nice_names,
         )
+        df = _merge_line_x_component_into_line(df)
         df.attrs["name"] = "Transmission"
         df.attrs["unit"] = "carrier dependent"
         return df
@@ -1141,8 +1359,17 @@ class StatisticsAccessor:
             nice_names=nice_names,
         )
         df = self._aggregate_components(func, agg=aggregate_groups, **kwargs)  # type: ignore
+        df = _merge_line_x_component_into_line(df)
         capacity = self.optimal_capacity(aggregate_groups=aggregate_groups, **kwargs)  # type: ignore
         df = df.div(capacity.reindex(df.index), axis=0)
+        sssc = self._aggregate_line_x_sssc_capacity_factor(
+            aggregate_time=aggregate_time,
+            aggregate_groups=aggregate_groups,
+            groupby=groupby,
+            nice_names=nice_names,
+        )
+        if not sssc.empty:
+            df = _append_component_carrier_rows(df, "LineX", sssc)
         df.attrs["name"] = "Capacity Factor"
         df.attrs["unit"] = "p.u."
         return df
@@ -1212,6 +1439,7 @@ class StatisticsAccessor:
             bus_carrier=bus_carrier,
             nice_names=nice_names,
         )
+        df = _merge_line_x_component_into_line(df)
         df.attrs["name"] = "Revenue"
         df.attrs["unit"] = "currency"
         return df

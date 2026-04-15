@@ -87,11 +87,12 @@ def test_assign_scaled_global_constraint_dual(ac_dc_network):
         transmission.sum() / scale <= limit / scale,
         name="GlobalConstraint-generation_limit",
     )
+    n._global_constraint_scales = {}
     n._global_constraint_scales["generation_limit"] = scale
 
     n.optimize.solve_model(assign_all_duals=True)
 
     raw_dual = float(m.constraints["GlobalConstraint-generation_limit"].dual)
     assert n.global_constraints.at["generation_limit", "mu"] == pytest.approx(
-        raw_dual * scale
+        raw_dual / scale
     )
