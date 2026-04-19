@@ -120,3 +120,54 @@ def test_line_x_iterative_optimization_runs():
     assert "ab" in n.line_xs_t.q_sssc.columns
     assert np.isfinite(n.line_xs.at["ab", "sssc_nom_opt"])
 
+
+def test_lpf_sssc_matches_opf():
+    """
+    Verify that LPF with q_sssc from OPF reproduces OPF branch flows.
+
+    After OPF, p0 values for each branch are set by the optimizer.
+    Running LPF with the same q_sssc input (and same generator dispatch)
+    should reproduce those flows up to DC linearization tolerance.
+    """
+    n = make_triangle_network()
+    n.convert_lines_to_line_x(
+        "ab",
+        capital_cost_sssc=0.5,
+        sssc_nom_extendable=True,
+        sssc_nom_max=50.0,
+    )
+
+    status, _ = n.optimize()
+    assert status == "ok"
+
+    # Record OPF branch flows
+    opf_line_xs_p0 = n.line_xs_t.p0.copy()   # LineX (ab)
+    opf_lines_p0 = n.lines_t.p0.copy()        # Lines (bc, ac)
+
+    # Feed OPF q_sssc and generator dispatch into LPF
+    # q_sssc is already in n.line_xs_t.q_sssc from optimize()
+    # Generator p is already in n.generators_t.p from optimize()
+    # Set p_set from optimized dispatch so LPF uses the same injections
+    for gen in n.generators.index:
+        n.generators_t["p_set"] = n.generators_t.p.copy()
+
+    n.lpf()
+
+    lpf_line_xs_p0 = n.line_xs_t.p0
+    lpf_lines_p0 = n.lines_t.p0
+
+    print("\n--- OPF vs LPF flow comparison ---")
+    print(f"q_sssc (ab): {n.line_xs_t.q_sssc['ab'].values}")
+    print(f"LineX ab  OPF p0={opf_line_xs_p0['ab'].values}  LPF p0={lpf_line_xs_p0['ab'].values}")
+    for line in n.lines.index:
+        print(f"Line  {line}  OPF p0={opf_lines_p0[line].values}  LPF p0={lpf_lines_p0[line].values}")
+
+    np.testing.assert_allclose(
+        lpf_line_xs_p0.values, opf_line_xs_p0.values, atol=1e-3,
+        err_msg="LineX p0 mismatch between LPF and OPF"
+    )
+    np.testing.assert_allclose(
+        lpf_lines_p0.values, opf_lines_p0.values, atol=1e-3,
+        err_msg="Lines p0 mismatch between LPF and OPF"
+    )
+

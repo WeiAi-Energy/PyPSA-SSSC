@@ -1535,10 +1535,34 @@ def sub_network_lpf(
     v_diff = np.zeros((len(sns), len(buses_o)))
     if len(branches_i) > 0:
         p = network.buses_t["p"].loc[sns, buses_o].values - sub_network.p_bus_shift
+
+        # SSSC contribution: w_l = q_sssc_l / (x_pu_eff_l * s_nom_l)
+        # Modified system: B*theta = p - K*w,  f = H*theta + w
+        carrier = network.sub_networks.at[sub_network.name, "carrier"]
+        x_attr = "r_pu_eff" if carrier == "DC" else "x_pu_eff"
+        w = np.zeros((len(branches_i), len(sns)))
+        branch_offset = 0
+        for c in sub_network.iterate_components(network.passive_branch_components):
+            n_c = len(c.ind)
+            if c.name == "LineX" and n_c > 0 and "q_sssc" in network.line_xs_t:
+                q_sssc = (
+                    network.line_xs_t.q_sssc.reindex(index=sns, columns=c.ind)
+                    .fillna(0.0)
+                    .values
+                )  # (n_sns, n_c)
+                x_pu = network.line_xs.loc[c.ind, x_attr].values  # (n_c,)
+                s_nom = network.line_xs.loc[c.ind, "s_nom"].values  # (n_c,)
+                denom = x_pu * s_nom
+                safe_denom = np.where(denom != 0, denom, np.inf)
+                w[branch_offset : branch_offset + n_c, :] = q_sssc.T / safe_denom[:, None]
+            branch_offset += n_c
+        p -= sub_network.K.dot(w).T  # adjust nodal injections: B*theta = p - K*w
+
         v_diff[:, 1:] = spsolve(sub_network.B[1:, 1:], p[:, 1:].T).T
         flows = (
             pd.DataFrame(v_diff * sub_network.H.T, columns=branches_i, index=sns)
             + sub_network.p_branch_shift
+            + pd.DataFrame(w.T, columns=branches_i, index=sns)  # direct SSSC flow: f = H*theta + w
         )
 
         for c in sub_network.iterate_components(network.passive_branch_components):
