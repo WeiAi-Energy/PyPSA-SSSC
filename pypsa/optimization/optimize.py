@@ -276,6 +276,9 @@ def create_model(
         Whether to optimise as a single investment period or to optimize in multiple
         investment periods. Then, snapshots should be a ``pd.MultiIndex``.
     transmission_losses : int, default 0
+        Number of segments per half-axis used for the piecewise linear
+        approximation of the branch loss parabola. Defaults to 0, which
+        ignores losses.
     linearized_unit_commitment : bool, default False
         Whether to optimise using the linearised unit commitment formulation or not.
     include_objective_constant : bool, default False
@@ -605,8 +608,10 @@ def optimize(
         investment periods. Then, snapshots should be a ``pd.MultiIndex``.
     transmission_losses : int, default 0
         Whether an approximation of transmission losses should be included
-        in the linearised power flow formulation. A passed number will denote
-        the number of tangents used for the piecewise linear approximation.
+        in the linearised power flow formulation. A passed number denotes the
+        number of segments per half-axis used for the piecewise linear
+        approximation of the loss parabola, which is thus approximated by
+        ``2 * transmission_losses + 1`` segments.
         Defaults to 0, which ignores losses.
     linearized_unit_commitment : bool, default False
         Whether to optimise using the linearised unit commitment formulation or not.

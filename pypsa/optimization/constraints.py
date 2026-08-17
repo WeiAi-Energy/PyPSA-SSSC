@@ -13,7 +13,7 @@ import linopy
 import numpy as np
 import pandas as pd
 from linopy import LinearExpression, merge
-from numpy import inf, isfinite
+from numpy import inf
 from scipy import sparse
 from xarray import DataArray, Dataset, concat
 
@@ -556,10 +556,7 @@ def define_nodal_balance_constraints(
             eff = get_as_dense(n, "Link", f"efficiency{i}", sns)
             args.append(["Link", "p", f"bus{i}", eff])
 
-    include_loss_terms = transmission_losses and not getattr(
-        n, "_rtep_inner_losses_accounted_in_bus_injection", False
-    )
-    if include_loss_terms:
+    if transmission_losses:
         args.extend(
             [
                 ["Line", "loss", "bus0", -0.5],
@@ -1010,134 +1007,137 @@ def define_store_constraints(n: Network, sns: pd.Index) -> None:
 def define_loss_constraints(
     n: Network, sns: pd.Index, c: str, transmission_losses: int
 ) -> None:
+    """
+    Sets the piecewise-linear approximation of the quadratic branch losses.
+
+    The approximation is exact in the nominal capacity: since the conductor is
+    scaled as r = rho / s_nom and the flow range as p_max = s_max_pu * s_nom,
+    the segment slopes are capacity-independent and the segment offsets are
+    linear in s_nom, so no outer iteration on r is required for the losses.
+
+    Parameters
+    ----------
+    n : pypsa.Network
+    sns : pd.Index
+        Snapshots of the constraint.
+    c : str
+        name of the network component
+    transmission_losses : int
+        Number of segments per half-axis; the loss parabola is approximated on
+        [-p_max, p_max] by 2 * transmission_losses + 1 segments.
+    """
     if n.df(c).empty or c not in n.passive_branch_components:
         return
 
-    fixed_losses = getattr(n, "_rtep_inner_fixed_branch_losses", None)
-    if isinstance(fixed_losses, dict) and c in fixed_losses:
-        active = get_activity_mask(n, c, sns) if n._multi_invest else None
-        loss = reindex(n.model[f"{c}-loss"], c, n.df(c).index)
-        fixed_loss = (
-            fixed_losses[c].reindex(
-                index=sns, columns=n.df(c).index, fill_value=0.0
-            ).clip(lower=0.0)
-        )
-        if isinstance(fixed_loss.index, pd.MultiIndex):
-            fixed_loss.index = fixed_loss.index.rename(sns.names)
-        else:
-            fixed_loss.index.name = "snapshot"
-        fixed_loss.columns = fixed_loss.columns.rename(c)
-        if active is not None:
-            active = active.reindex(
-                index=fixed_loss.index, columns=fixed_loss.columns, fill_value=False
-            )
-            fixed_loss = fixed_loss.where(active, 0.0)
-        n.model.add_constraints(
-            loss,
-            "=",
-            fixed_loss,
-            name=f"{c}-loss_fixed_from_outer",
-        )
-        return
+    n_side = max(1, int(transmission_losses))
 
-    tangents = transmission_losses
-    active = get_activity_mask(n, c, sns) if n._multi_invest else None
+    # Piecewise-linear approximation of the quadratic loss r * p**2 on
+    # [-p_max, p_max]. The interval is split into 2 * n_side + 1 segments of
+    # width delta = p_max / (2 * n_side + 1); segment k = 1 ... n_side covers
+    # [(2k-1) delta, (2k+1) delta] and is fitted by least squares, the central
+    # segment being covered by loss >= 0.
+    #
+    # The least-squares fit of r * p**2 on [x0, x1] has the closed form
+    #     slope  =  r * (x0 + x1)
+    #     offset = -r * (x0**2 + 4 * x0 * x1 + x1**2) / 6
+    # which is homogeneous: scaling the interval by alpha scales the slope by
+    # alpha and the offset by alpha**2. Evaluating it on the normalised
+    # interval (r = 1, p_max = 1) therefore yields branch-independent
+    # coefficients that only have to be rescaled by r and p_max:
+    #     slope_k  =  r * p_max    * slope_hat[k]
+    #     offset_k = -r * p_max**2 * offset_hat[k]
+    k = np.arange(1, n_side + 1, dtype=float)
+    slope_hat = 4.0 * k / (2.0 * n_side + 1.0)
+    offset_hat = (12.0 * k**2 - 1.0) / (3.0 * (2.0 * n_side + 1.0) ** 2)
 
-    s_max_pu = get_as_dense(n, c, "s_max_pu").loc[sns]
+    # Both factors are tied to the branch capacity: the conductor is scaled as
+    # r = rho / s_nom (rho = r * s_nom invariant, see
+    # optimize_transmission_expansion_iteratively) and the flow is bounded by
+    # p_max = u * s_nom with u = max_t s_max_pu. Substituting both,
+    #     slope_k  = rho * u    * slope_hat[k]                (s_nom cancels)
+    #     offset_k = rho * u**2 * offset_hat[k] * s_nom       (linear in s_nom)
+    # so for extendable branches the offset can be carried as a term in the
+    # s_nom variable instead of being frozen at an assumed capacity. The loss
+    # constraints are then exact in s_nom and need no outer iteration.
+    df = n.df(c)
+    s_nom_def = df["_s_nom_def"] if "_s_nom_def" in df else df["s_nom"]
+    s_nom_def = s_nom_def.astype(float).fillna(df["s_nom"])
+    rho = df["r_pu_eff"].astype(float) * s_nom_def
+    u = get_as_dense(n, c, "s_max_pu").loc[sns].max(axis=0).reindex(df.index)
 
-    # Prefer solved capacities when available (e.g. iterative workflows), while
-    # keeping model-build compatibility by falling back to design limits.
-    s_nom_opt = (
-        n.df(c)["s_nom_opt"]
-        if "s_nom_opt" in n.df(c)
-        else pd.Series(np.nan, index=n.df(c).index)
-    )
-    s_max = s_nom_opt.where((s_nom_opt > 0) & np.isfinite(s_nom_opt), n.df(c)["s_nom"])
-
-    if not isfinite(s_max).all():
+    ext_i = n.get_extendable_i(c)
+    undefined = ext_i[
+        ~(np.isfinite(rho.reindex(ext_i)) & (s_nom_def.reindex(ext_i) > 0))
+    ]
+    if not undefined.empty:
         msg = (
-            "Loss approximation requires finite branch capacities "
-            "(derived from 's_nom_opt' or 's_nom_max/s_nom'):\n "
-            f"{s_max[~isfinite(s_max)]}"
+            "The loss approximation scales the resistance with the branch "
+            "capacity and hence requires a strictly positive reference "
+            f"capacity with a finite 'r_pu_eff' for every extendable {c}. Set "
+            "'s_nom' to the capacity the given 'r' refers to for:\n"
+            f"{list(undefined)}"
         )
         raise ValueError(msg)
 
-    r_pu_eff = n.df(c)["r_pu_eff"]
+    rho = rho.where(np.isfinite(rho), 0.0)
+    u = u.where(np.isfinite(u), 0.0)
 
     loss = n.model[f"{c}-loss"]
     flow = n.model[f"{c}-s"]
 
-    def fit_piece_analytic(
-        r: float, x0: float, x1: float, through_origin: bool
-    ) -> tuple[float, float]:
-        """
-        Analytic least-squares fit for y = r*p^2 ~= a*p + b on [x0, x1].
-        """
-        if not isfinite(r) or x1 <= x0 or x1 <= 0.0:
-            return 0.0, 0.0
-
-        if through_origin:
-            i2 = (x1**3 - x0**3) / 3.0
-            i3 = 0.25 * (x1**4 - x0**4)
-            if abs(i2) < 1e-16:
-                return 0.0, 0.0
-            return float(r * (i3 / i2)), 0.0
-
-        i0 = x1 - x0
-        i1 = 0.5 * (x1**2 - x0**2)
-        i2 = (x1**3 - x0**3) / 3.0
-        i3 = 0.25 * (x1**4 - x0**4)
-
-        denom = i2 * i0 - i1**2
-        if abs(denom) < 1e-16:
-            return fit_piece_analytic(r, x0, x1, through_origin=True)
-
-        a = r * (i3 * i0 - i2 * i1) / denom
-        b = r * (i2 * i2 - i3 * i1) / denom
-        return float(a), float(b)
-
-    # Generalized (2n+1)-segment fit on [-p_max, p_max]
-    n_side = max(1, int(tangents))
-    p_max = (s_max_pu * s_max).max(axis=0).to_numpy()
-    r_val = r_pu_eff.to_numpy()
-    idx = n.df(c).index
-    n_br = len(idx)
-
-    slopes = np.zeros((n_br, n_side))
-    offsets = np.zeros((n_br, n_side))
-
-    for i in range(n_br):
-        pmax_i = float(p_max[i]) if isfinite(p_max[i]) else 0.0
-        r_i = float(r_val[i]) if isfinite(r_val[i]) else np.nan
-        if pmax_i <= 0.0 or not isfinite(r_i):
-            continue
-
-        delta_i = pmax_i / (2.0 * n_side + 1.0)
-
-        for k in range(1, n_side + 1):
-            x0 = (2 * k - 1) * delta_i
-            x1 = (2 * k + 1) * delta_i
-            a, b = fit_piece_analytic(r_i, x0, x1, through_origin=False)
-            if b < 0 and b > -1e-14:
-                b = 0.0
-            slopes[i, k - 1] = a
-            offsets[i, k - 1] = b
-
     n.model.add_constraints(
         loss >= 0.0,
         name=f"{c}-loss_center_nonneg",
-        mask=active,
+        mask=get_activity_mask(n, c, sns) if n._multi_invest else None,
     )
 
-    for k in range(n_side):
-        slope_k = pd.Series(slopes[:, k], index=idx)
-        offset_k = pd.Series(offsets[:, k], index=idx)
-        lhs_plus = n.model.linexpr((1, loss), (-slope_k, flow))
-        lhs_minus = n.model.linexpr((1, loss), (slope_k, flow))
+    fix_i = df.index.difference(ext_i).rename(c)
+    if not fix_i.empty:
+        active = get_activity_mask(n, c, sns, fix_i) if n._multi_invest else None
+        loss_fix = reindex(loss, c, fix_i)
+        flow_fix = reindex(flow, c, fix_i)
+        # s_nom is a parameter here, so rho * u**2 * s_nom collapses back to
+        # the plain constant r * p_max**2.
+        base = rho.reindex(fix_i) * u.reindex(fix_i)
+        offset = base * u.reindex(fix_i) * s_nom_def.reindex(fix_i)
+        for j in range(n_side):
+            slope = base * slope_hat[j]
+            rhs = -offset * offset_hat[j]
+            n.model.add_constraints(
+                n.model.linexpr((1, loss_fix), (-slope, flow_fix)),
+                ">=",
+                rhs,
+                name=f"{c}-fix-loss_tangents-{j + 1}-1",
+                mask=active,
+            )
+            n.model.add_constraints(
+                n.model.linexpr((1, loss_fix), (slope, flow_fix)),
+                ">=",
+                rhs,
+                name=f"{c}-fix-loss_tangents-{j + 1}--1",
+                mask=active,
+            )
 
-        n.model.add_constraints(
-            lhs_plus >= offset_k, name=f"{c}-loss_tangents-{k + 1}-1", mask=active
-        )
-        n.model.add_constraints(
-            lhs_minus >= offset_k, name=f"{c}-loss_tangents-{k + 1}--1", mask=active
-        )
+    if not ext_i.empty:
+        active = get_activity_mask(n, c, sns, ext_i) if n._multi_invest else None
+        loss_ext = reindex(loss, c, ext_i)
+        flow_ext = reindex(flow, c, ext_i)
+        capacity = n.model[f"{c}-{nominal_attrs[c]}"]
+        base = rho.reindex(ext_i) * u.reindex(ext_i)
+        for j in range(n_side):
+            slope = base * slope_hat[j]
+            gamma = base * u.reindex(ext_i) * offset_hat[j]
+            n.model.add_constraints(
+                n.model.linexpr((1, loss_ext), (-slope, flow_ext), (gamma, capacity)),
+                ">=",
+                0,
+                name=f"{c}-ext-loss_tangents-{j + 1}-1",
+                mask=active,
+            )
+            n.model.add_constraints(
+                n.model.linexpr((1, loss_ext), (slope, flow_ext), (gamma, capacity)),
+                ">=",
+                0,
+                name=f"{c}-ext-loss_tangents-{j + 1}--1",
+                mask=active,
+            )
