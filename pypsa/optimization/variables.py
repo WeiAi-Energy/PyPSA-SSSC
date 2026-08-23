@@ -171,4 +171,6 @@ def define_line_x_variables(n: Network, sns: Sequence) -> None:
     if ext_i.empty:
         return
 
-    n.model.add_variables(coords=[ext_i], name=f"{c}-sssc_nom")
+    lower = n.df(c).sssc_nom_min.reindex(ext_i)
+    upper = n.df(c).sssc_nom_max.reindex(ext_i)
+    n.model.add_variables(lower, upper, coords=[ext_i], name=f"{c}-sssc_nom")

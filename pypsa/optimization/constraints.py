@@ -621,9 +621,162 @@ def define_nodal_balance_constraints(
     n.model.add_constraints(lhs, "=", rhs, name=f"Bus{suffix}-nodal_balance", mask=mask)
 
 
+def capacity_reference(n: Network, c: str) -> pd.Series:
+    """
+    Reference capacity the capacity-dependent branch parameters are evaluated
+    at.
+
+    Iterative transmission expansion (see
+    ``optimize_transmission_expansion_iteratively``) linearises the
+    capacity-dependent branch impedance around a capacity vector which it
+    stores in the private column ``_s_nom_def``. Without such a linearisation
+    point the nominal capacity of the branch is used.
+    """
+    df = n.df(c)
+    nominal = df[nominal_attrs[c]].astype(float)
+    if "_s_nom_def" not in df:
+        return nominal
+    return df["_s_nom_def"].astype(float).fillna(nominal)
+
+
+def kirchhoff_voltage_cycles(
+    n: Network, period: int | None = None
+) -> list[tuple[pd.MultiIndex, sparse.csc_matrix, np.ndarray, str]]:
+    """
+    Independent cycles of the passive branch network per sub-network.
+
+    The network topology is (re-)determined, so the returned cycle bases are
+    consistent with ``n.sub_networks``.
+
+    Parameters
+    ----------
+    n : pypsa.Network
+    period : int, optional
+        Investment period to restrict the active assets to.
+
+    Returns
+    -------
+    list of tuple
+        One entry per sub-network which contains at least one cycle, given as
+        ``(branches, C, weightings, carrier)``. ``branches`` is a
+        ``pd.MultiIndex`` of ``(component, name)`` pairs of all branches of the
+        sub-network, ``C`` the cycle incidence matrix with the branches of
+        ``branches`` as rows and the independent cycles as columns,
+        ``weightings`` the impedance entering the voltage law (``x_pu_eff`` for
+        AC and ``r_pu_eff`` for DC sub-networks) and ``carrier`` the carrier of
+        the sub-network.
+    """
+    n.determine_network_topology(investment_period=period, skip_isolated_buses=True)
+
+    cycles = []
+    for sub in n.sub_networks.obj:
+        if not sub.C.size:
+            continue
+
+        branches = sub.branches()
+        branches_i = branches.index
+        if not isinstance(branches_i, pd.MultiIndex):
+            branches_i = pd.MultiIndex.from_arrays(
+                [pd.Index(["Line"] * len(branches_i)), branches_i]
+            )
+        branches_i = branches_i.set_names(["component", "name"])
+
+        carrier = n.sub_networks.carrier[sub.name]
+        weightings = branches.x_pu_eff if carrier == "AC" else branches.r_pu_eff
+        cycles.append(
+            (
+                branches_i,
+                sparse.csc_matrix(sub.C),
+                weightings.to_numpy(dtype=float),
+                carrier,
+            )
+        )
+    return cycles
+
+
+def define_relative_capacity_deviation(
+    n: Network, c: str, reference: pd.Series
+) -> pd.Series:
+    """
+    Auxiliary variable carrying the capacity linearisation of the voltage law.
+
+    The sensitivity of a branch term of the voltage law to the branch capacity
+    is of the order ``term / F``, so with the capacity measured in MW the
+    linearised constraint carries coefficients that are smaller than its own
+    flow coefficients by the capacity itself, i.e. by three to four orders of
+    magnitude. Rescaling the row cannot repair that, since the spread sits
+    *within* the row, and rescaling the capacity column is not available
+    either: the same column carries the capital cost and the flow limits, where
+    the MW scale is the right one.
+
+    The linearisation is therefore expressed in the dimensionless deviation
+
+    .. math::
+        u_l = F_l / \\bar{F}_l - 1
+
+    of the capacity from the linearisation point, which is defined here by one
+    equation per branch. Its coefficient in the voltage law is the branch term
+    itself, which sits on the scale of the flow coefficients of the same row,
+    and the right hand side of the voltage law stays identically zero instead
+    of becoming the residual of the linearisation point, i.e. a sum of terms
+    that cancel down to round-off.
+
+    Returns
+    -------
+    labels : pandas.Series
+        Variable labels of ``u`` indexed by the branch names.
+    """
+    m = n.model
+    attr = nominal_attrs[c]
+    capacity = m[f"{c}-{attr}"]
+    dim = capacity.dims[0]
+    index = capacity.indexes[dim]
+
+    scale = reference.reindex(index).astype(float)
+    # the caller floors the linearisation capacity away from zero, this only
+    # guards against a division by zero
+    scale = scale.where(scale.abs() > 0.0, 1.0)
+    inverse = DataArray(1.0 / scale.to_numpy(), coords=[index], dims=[dim])
+
+    # F_l >= 0 makes u_l >= -1 an exact bound, independent of the step size
+    deviation = m.add_variables(
+        lower=-1.0, coords=[index], name=f"{c}-{attr}_relative"
+    )
+    m.add_constraints(
+        capacity * inverse - deviation,
+        "=",
+        1.0,
+        name=f"{c}-{attr}_relative-definition",
+    )
+    return deviation.labels.to_pandas()
+
+
 def define_kirchhoff_voltage_constraints(n: Network, sns: pd.Index) -> None:
     """
     Defines Kirchhoff voltage constraints.
+
+    Per independent cycle the sum of the branch terms
+    ``x_pu_eff * s - q_sssc / s_nom_def`` has to vanish, where the second term
+    is the series compensation of an SSSC on a ``LineX`` branch.
+
+    If ``n._kvl_capacity_sensitivity`` is set, the constraint additionally
+    carries the first-order sensitivity of these terms with respect to the
+    branch capacity, i.e. the term of branch ``l`` is replaced by its
+    linearisation
+
+    .. math::
+        x_l s_l - q_l / \\bar{F}_l - \\alpha_{l,t} \\bar{F}_l u_l
+
+    around the capacity ``s_nom_def`` = :math:`\\bar{F}`, written in the
+    relative capacity deviation :math:`u_l = F_l / \\bar{F}_l - 1` of
+    ``define_relative_capacity_deviation`` rather than in the capacity itself,
+    which keeps the coefficients of the linearisation on the scale of the flow
+    coefficients of their row and the right hand side at zero. The
+    sensitivities :math:`\\alpha` are provided as a DataFrame with the
+    snapshots as index and ``(component, name)`` pairs as columns by
+    ``optimize_transmission_expansion_iteratively`` with
+    ``method='trust_region'``. Without them, the capacity dependence of the
+    impedance is only resolved by the outer fixed-point iteration.
     """
     m = n.model
     n.calculate_dependent_values()
@@ -639,63 +792,128 @@ def define_kirchhoff_voltage_constraints(n: Network, sns: pd.Index) -> None:
     if "LineX-q_sssc" in m.variables:
         line_x_q = m["LineX-q_sssc"].to_pandas()
 
-    lhs = []
+    s_nom_def = pd.concat({c: capacity_reference(n, c) for c in comps}, names=names)
 
+    sensitivity = getattr(n, "_kvl_capacity_sensitivity", None)
+    deviation_labels: dict[str, pd.Series] = {}
+    if sensitivity is not None and not sensitivity.empty:
+        extendable: dict[str, pd.Index] = {}
+        for c in comps:
+            var = f"{c}-{nominal_attrs[c]}"
+            if var in m.variables:
+                extendable[c] = m[var].indexes[m[var].dims[0]]
+        keep = [
+            col
+            for col in sensitivity.columns
+            if col[0] in extendable and col[1] in extendable[col[0]]
+        ]
+        sensitivity = sensitivity[keep] if keep else None
+        if sensitivity is not None:
+            # the linearisation enters through the relative capacity deviation
+            # rather than through the capacity itself
+            for c in sorted({col[0] for col in keep}):
+                deviation_labels[c] = define_relative_capacity_deviation(
+                    n, c, s_nom_def.xs(c, level="component")
+                )
+    else:
+        sensitivity = None
+
+    # Cycle bases built from a spanning tree ("fundamental cycles") are not size
+    # balanced: most chords close a short local loop, but a chord connecting two
+    # points that are far apart on the tree drags in every branch on the tree path
+    # between them, so a handful of cycles can be orders of magnitude larger than
+    # the rest. linopy's merge pads every cycle's term axis to the size of the
+    # largest one being merged, so merging the whole cycle basis in one call turns
+    # a mostly-small, right-skewed distribution into one dense (snapshot x cycles x
+    # max_terms) array sized by the few outliers. Bucketing by term count before
+    # merging keeps the padding local to cycles of similar size instead.
+    kvl_size_buckets = np.array([32, 128, 512, 2048, inf])
+
+    added = 0
     periods = sns.unique("period") if n._multi_invest else [None]
 
     for period in periods:
-        n.determine_network_topology(investment_period=period, skip_isolated_buses=True)
-
         snapshots = sns if period is None else sns[sns.get_loc(period)]
+        nsns = len(snapshots)
 
         exprs_list = []
-        for sub in n.sub_networks.obj:
-            branches = sub.branches()
+        for branches_i, C, weightings, carrier in kirchhoff_voltage_cycles(n, period):
+            ssub = s.loc[snapshots, branches_i].to_numpy()
+            f_ref = s_nom_def.loc[branches_i].to_numpy()
 
-            if not sub.C.size:
-                continue
+            # series compensation of the SSSCs, active on LineX branches only
+            has_q = np.zeros(len(branches_i), dtype=bool)
+            q_sub = None
+            if carrier == "AC" and line_x_q is not None:
+                has_q = np.asarray(branches_i.get_level_values(0) == "LineX")
+                if has_q.any():
+                    q_sub = np.zeros((nsns, len(branches_i)))
+                    q_sub[:, has_q] = line_x_q.loc[
+                        snapshots, branches_i.get_level_values(1)[has_q]
+                    ].to_numpy()
 
-            carrier = n.sub_networks.carrier[sub.name]
-            weightings = branches.x_pu_eff if carrier == "AC" else branches.r_pu_eff
-            C_flow = 1e4 * sparse.diags(weightings.values) * sub.C
-            ssub = s.loc[snapshots, branches.index].values
+            # first-order sensitivity of the branch terms to the capacity
+            has_alpha = np.zeros(len(branches_i), dtype=bool)
+            alpha_sub = None
+            alpha_labels = None
+            if sensitivity is not None:
+                has_alpha = np.asarray(branches_i.isin(sensitivity.columns))
+                if has_alpha.any():
+                    alpha_sub = np.zeros((nsns, len(branches_i)))
+                    alpha_sub[:, has_alpha] = sensitivity.reindex(
+                        index=snapshots, columns=branches_i[has_alpha]
+                    ).to_numpy()
+                    alpha_labels = np.full(len(branches_i), -1, dtype=int)
+                    alpha_labels[has_alpha] = [
+                        deviation_labels[c].at[i] for c, i in branches_i[has_alpha]
+                    ]
 
-            if isinstance(branches.index, pd.MultiIndex):
-                branches_component = branches.index.get_level_values(0)
-                branches_name = branches.index.get_level_values(1)
-            else:
-                branches_component = pd.Index(["Line"] * len(branches.index))
-                branches_name = branches.index
+            for j in range(C.shape[1]):
+                sl = slice(C.indptr[j], C.indptr[j + 1])
+                rows = C.indices[sl]
+                orientation = C.data[sl]
 
-            s_nom_def = pd.Series(np.nan, index=branches.index, dtype=float)
-            if "LineX" in branches_component:
-                line_x_i = branches_name[branches_component == "LineX"]
-                defs = n.line_xs.get("_s_nom_def", n.line_xs.s_nom).reindex(line_x_i)
-                s_nom_def.loc[pd.MultiIndex.from_arrays(
-                    [pd.Index(["LineX"] * len(line_x_i)), line_x_i]
-                )] = defs.values
+                coeffs_parts = [1e4 * orientation * weightings[rows]]
+                vars_parts = [ssub[:, rows]]
 
-            ncycles = C_flow.shape[1]
+                if q_sub is not None and has_q[rows].any():
+                    sel = has_q[rows]
+                    q_rows = rows[sel]
+                    coeffs_parts.append(-1e4 * orientation[sel] / f_ref[q_rows])
+                    vars_parts.append(q_sub[:, q_rows])
 
-            for j in range(ncycles):
-                c_flow = C_flow.getcol(j).tocoo()
-                coeffs_parts = [c_flow.data]
-                vars_parts = [ssub[:, c_flow.row]]
+                if alpha_sub is not None and has_alpha[rows].any():
+                    sel = has_alpha[rows]
+                    a_rows = rows[sel]
+                    # the deviation is relative, so the coefficient of branch l
+                    # is alpha_l * F_def_l, i.e. its voltage law term itself
+                    alpha_coeffs = -1e4 * (
+                        orientation[sel] * alpha_sub[:, a_rows] * f_ref[a_rows]
+                    )
+                    # sensitivities the caller truncated away leave a vanishing
+                    # coefficient. Masking the variable as well keeps the term
+                    # out of the problem for either of linopy's writers, only
+                    # one of which filters on the coefficient.
+                    alpha_vars = np.where(
+                        alpha_coeffs == 0.0, -1, alpha_labels[a_rows]
+                    )
+                    coeffs_parts.append(alpha_coeffs)
+                    vars_parts.append(alpha_vars)
 
-                if carrier == "AC" and line_x_q is not None:
-                    c_base = (1e4 * sub.C).getcol(j).tocoo()
-                    if c_base.nnz:
-                        rows = c_base.row
-                        mask = branches_component[rows] == "LineX"
-                        if mask.any():
-                            q_rows = rows[mask]
-                            q_names = branches_name[q_rows]
-                            q_coeffs = -c_base.data[mask] / s_nom_def.iloc[q_rows].to_numpy()
-                            q_vars = line_x_q.loc[snapshots, q_names].values
-                            coeffs_parts.append(q_coeffs)
-                            vars_parts.append(q_vars)
-
-                coeffs = DataArray(np.concatenate(coeffs_parts), dims="_term")
+                if any(part.ndim == 2 for part in coeffs_parts):
+                    coeffs_parts = [
+                        part
+                        if part.ndim == 2
+                        else np.broadcast_to(part, (nsns, part.size))
+                        for part in coeffs_parts
+                    ]
+                    coeffs = DataArray(
+                        np.concatenate(coeffs_parts, axis=1),
+                        dims=("snapshot", "_term"),
+                        coords={"snapshot": snapshots},
+                    )
+                else:
+                    coeffs = DataArray(np.concatenate(coeffs_parts), dims="_term")
                 vars = DataArray(
                     np.concatenate(vars_parts, axis=1),
                     dims=("snapshot", "_term"),
@@ -704,14 +922,28 @@ def define_kirchhoff_voltage_constraints(n: Network, sns: pd.Index) -> None:
                 ds = Dataset({"coeffs": coeffs, "vars": vars})
                 exprs_list.append(LinearExpression(ds, m))
 
-        if len(exprs_list):
-            exprs = merge(exprs_list, dim="cycles")
-            exprs = exprs.assign_coords(cycles=range(len(exprs.data.cycles)))
-            lhs.append(exprs)
+        if not len(exprs_list):
+            continue
 
-    if len(lhs):
-        lhs = merge(lhs, dim="snapshot")
-        m.add_constraints(lhs, "=", 0, name="Kirchhoff-Voltage-Law")
+        nterms = np.fromiter(
+            (e.data.sizes["_term"] for e in exprs_list), dtype=int, count=len(exprs_list)
+        )
+        bucket_ids = np.searchsorted(kvl_size_buckets, nterms, side="left")
+
+        for bucket_id in np.unique(bucket_ids):
+            idx = np.flatnonzero(bucket_ids == bucket_id)
+
+            bucket_exprs = merge([exprs_list[i] for i in idx], dim="cycles")
+            bucket_exprs = bucket_exprs.assign_coords(cycles=range(len(idx)))
+
+            suffix = f"{bucket_id}" if period is None else f"{period}-{bucket_id}"
+            m.add_constraints(
+                bucket_exprs, "=", 0, name=f"Kirchhoff-Voltage-Law-{suffix}"
+            )
+            added += 1
+
+    if not added:
+        return
 
 
 def define_line_x_sssc_constraints(n: Network, sns: pd.Index) -> None:
@@ -742,11 +974,7 @@ def define_line_x_sssc_constraints(n: Network, sns: pd.Index) -> None:
     active = get_activity_mask(n, c, sns, ext_i) if n._multi_invest else None
     q_ext = reindex(q, c, ext_i)
     sssc = m[f"{c}-sssc_nom"]
-    sssc_min = n.df(c).sssc_nom_min.reindex(ext_i)
-    sssc_max = n.df(c).sssc_nom_max.reindex(ext_i)
 
-    m.add_constraints(sssc >= sssc_min, name=f"{c}-sssc_nom-lower")
-    m.add_constraints(sssc <= sssc_max, name=f"{c}-sssc_nom-upper")
     m.add_constraints(q_ext - sssc <= 0, name=f"{c}-ext-q_sssc-upper", mask=active)
     m.add_constraints(q_ext + sssc >= 0, name=f"{c}-ext-q_sssc-lower", mask=active)
 
@@ -1023,8 +1251,8 @@ def define_loss_constraints(
     c : str
         name of the network component
     transmission_losses : int
-        Number of segments per half-axis; the loss parabola is approximated on
-        [-p_max, p_max] by 2 * transmission_losses + 1 segments.
+        Number of least-squares segments per half-axis; the loss parabola is
+        approximated on [-p_max, p_max] by 2 * transmission_losses segments.
     """
     if n.df(c).empty or c not in n.passive_branch_components:
         return
@@ -1032,10 +1260,12 @@ def define_loss_constraints(
     n_side = max(1, int(transmission_losses))
 
     # Piecewise-linear approximation of the quadratic loss r * p**2 on
-    # [-p_max, p_max]. The interval is split into 2 * n_side + 1 segments of
-    # width delta = p_max / (2 * n_side + 1); segment k = 1 ... n_side covers
-    # [(2k-1) delta, (2k+1) delta] and is fitted by least squares, the central
-    # segment being covered by loss >= 0.
+    # [-p_max, p_max]. Each half-axis is split into n_side segments of width
+    # delta = p_max / n_side; segment k = 1 ... n_side covers
+    # [(k-1) delta, k delta] and is fitted by least squares. The innermost
+    # segment is instead fitted under the constraint that it passes through the
+    # origin, so that the envelope does too and the losses stay non-negative:
+    #     min_a int_0^delta (a p - r p**2)**2 dp  =>  a = 3 r delta / 4.
     #
     # The least-squares fit of r * p**2 on [x0, x1] has the closed form
     #     slope  =  r * (x0 + x1)
@@ -1047,8 +1277,10 @@ def define_loss_constraints(
     #     slope_k  =  r * p_max    * slope_hat[k]
     #     offset_k = -r * p_max**2 * offset_hat[k]
     k = np.arange(1, n_side + 1, dtype=float)
-    slope_hat = 4.0 * k / (2.0 * n_side + 1.0)
-    offset_hat = (12.0 * k**2 - 1.0) / (3.0 * (2.0 * n_side + 1.0) ** 2)
+    slope_hat = (2.0 * k - 1.0) / n_side
+    offset_hat = (6.0 * k**2 - 6.0 * k + 1.0) / (6.0 * n_side**2)
+    slope_hat[0] = 0.75 / n_side
+    offset_hat[0] = 0.0
 
     # Both factors are tied to the branch capacity: the conductor is scaled as
     # r = rho / s_nom (rho = r * s_nom invariant, see
@@ -1060,8 +1292,7 @@ def define_loss_constraints(
     # s_nom variable instead of being frozen at an assumed capacity. The loss
     # constraints are then exact in s_nom and need no outer iteration.
     df = n.df(c)
-    s_nom_def = df["_s_nom_def"] if "_s_nom_def" in df else df["s_nom"]
-    s_nom_def = s_nom_def.astype(float).fillna(df["s_nom"])
+    s_nom_def = capacity_reference(n, c)
     rho = df["r_pu_eff"].astype(float) * s_nom_def
     u = get_as_dense(n, c, "s_max_pu").loc[sns].max(axis=0).reindex(df.index)
 
@@ -1084,12 +1315,6 @@ def define_loss_constraints(
 
     loss = n.model[f"{c}-loss"]
     flow = n.model[f"{c}-s"]
-
-    n.model.add_constraints(
-        loss >= 0.0,
-        name=f"{c}-loss_center_nonneg",
-        mask=get_activity_mask(n, c, sns) if n._multi_invest else None,
-    )
 
     fix_i = df.index.difference(ext_i).rename(c)
     if not fix_i.empty:

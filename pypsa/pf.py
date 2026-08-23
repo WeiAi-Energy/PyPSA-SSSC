@@ -4,6 +4,7 @@ Power flow functionality.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections.abc import Callable, Sequence
@@ -1406,6 +1407,247 @@ def find_tree(sub_network: SubNetwork, weight: str = "x_pu") -> None:
             sub_network.T[branch_i, j] = sign
 
 
+def _bfs_fundamental_cycles_from_root(graph: nx.Graph, root: Any) -> list[list[Any]]:
+    """
+    Fundamental cycle basis from a breadth-first spanning tree of ``graph``
+    rooted at ``root``.
+
+    ``nx.cycle_basis`` builds its spanning tree by an arbitrary depth-first
+    traversal, which gives no control over how long the resulting
+    fundamental cycles are: a chord that happens to connect two nodes far
+    apart on that DFS tree drags in every branch on the tree path between
+    them. A breadth-first tree keeps tree-paths close to shortest paths in
+    the graph, which keeps most fundamental cycles small.
+
+    Returns a list of cycles in the same format as ``nx.cycle_basis``: each
+    cycle is a list of nodes in cyclic order, i.e. consecutive entries
+    (with wraparound) are connected by a graph edge.
+    """
+    tree = nx.bfs_tree(graph, root)
+
+    parent = dict.fromkeys([root])
+    for u, v in tree.edges():
+        parent[v] = u
+
+    tree_edges = {frozenset(e) for e in tree.edges()}
+    chords = [e for e in graph.edges() if frozenset(e) not in tree_edges]
+    if not chords:
+        return []
+
+    lca = dict(
+        nx.tree_all_pairs_lowest_common_ancestor(tree, root=root, pairs=chords)
+    )
+
+    cycles: list[list[Any]] = []
+    for u, v in chords:
+        ancestor = lca.get((u, v), lca.get((v, u)))
+
+        up = [u]
+        while up[-1] != ancestor:
+            up.append(parent[up[-1]])
+
+        down = [v]
+        while down[-1] != ancestor:
+            down.append(parent[down[-1]])
+
+        cycles.append(up + down[-2::-1])
+
+    return cycles
+
+
+def _multi_root_bfs_cycles(graph: nx.Graph, num_roots: int = 5) -> list[list[Any]]:
+    """
+    Fundamental cycle basis picked from the best of several breadth-first
+    spanning trees per connected component.
+
+    A single BFS tree already keeps most fundamental cycles small (see
+    ``_bfs_fundamental_cycles_from_root``), but which node is the root still
+    matters: a chord that lands far from the root on the tree still drags in
+    a long tree path. Trying a handful of high-degree roots and keeping
+    whichever tree gives the smallest worst-case cycle catches cases the
+    single highest-degree root misses, for a small constant-factor cost
+    (``num_roots`` BFS traversals instead of one). Like the single-root
+    version, this is purely topological.
+    """
+    cycles: list[list[Any]] = []
+
+    for component in nx.connected_components(graph):
+        if len(component) < 2:
+            continue
+
+        sub = graph.subgraph(component)
+        roots = [
+            node
+            for node, _ in sorted(sub.degree(), key=itemgetter(1), reverse=True)[
+                :num_roots
+            ]
+        ]
+
+        best: list[list[Any]] | None = None
+        best_score: tuple[int, int] | None = None
+        for root in roots:
+            candidate = _bfs_fundamental_cycles_from_root(sub, root)
+            score = (
+                max((len(c) for c in candidate), default=0),
+                sum(len(c) for c in candidate),
+            )
+            if best_score is None or score < best_score:
+                best, best_score = candidate, score
+
+        cycles.extend(best or [])
+
+    return cycles
+
+
+def _edges_to_cycle_order(edges: list[tuple[Any, Any]]) -> list[Any]:
+    """
+    Turn an unordered edge set that is known to form one simple cycle into a
+    node list in cyclic order, i.e. the format ``nx.cycle_basis`` and
+    ``_bfs_fundamental_cycles_from_root`` use.
+
+    Every node touched by a simple cycle's edges has degree exactly 2 within
+    that edge set, so a plain walk (never stepping back the way we came)
+    closes the loop.
+    """
+    adjacency: dict[Any, list[Any]] = {}
+    for u, v in edges:
+        adjacency.setdefault(u, []).append(v)
+        adjacency.setdefault(v, []).append(u)
+
+    start = next(iter(adjacency))
+    order = [start]
+    previous = None
+    current = start
+    while True:
+        a, b = adjacency[current]
+        nxt = b if a == previous else a
+        if nxt == start:
+            return order
+        order.append(nxt)
+        previous, current = current, nxt
+
+
+def _pairwise_exchange_refine(
+    cycles: list[list[Any]], max_passes: int = 50
+) -> list[list[Any]]:
+    """
+    Shrink a fundamental cycle basis by repeated pairwise exchange.
+
+    A cycle basis only has to span the graph's cycle space; which specific
+    basis gets used is a free choice that does not change the KVL
+    constraints it defines (any basis represents the same voltage-law
+    equations, just organised as a different set of rows). It does change
+    how large those rows are, which matters because the optimization model
+    pads every cycle's coefficient/variable arrays to the size of the
+    largest cycle in the basis (see
+    ``pypsa.optimization.constraints.define_kirchhoff_voltage_constraints``),
+    so a handful of very large cycles can bloat memory and solver fill-in
+    even though most cycles are tiny.
+
+    For any two basis cycles whose symmetric difference (XOR of their edge
+    sets) is itself a single simple cycle shorter than the longer of the
+    two, replacing that longer cycle with the symmetric difference keeps the
+    basis independent (it is the same elementary row operation as a
+    Gaussian-elimination pivot: cycle B is untouched, cycle A becomes
+    A XOR B) while strictly shrinking it. Repeating this greedily, longest
+    cycles first, until no swap helps converges to a local optimum -- not
+    the true minimum cycle basis (that needs a global search, e.g. an
+    integer program per cycle), but it captures most of the achievable
+    reduction at a tiny fraction of the cost: milliseconds to a few seconds
+    even for a sub-network with thousands of independent cycles, versus
+    minutes or more for an exact minimum cycle basis solve.
+
+    Only candidate pairs that actually share an edge are ever considered
+    (via an edge -> cycle-indices index), and every candidate swap is
+    verified -- by checking every touched node has degree exactly 2 in the
+    symmetric difference, and that a single walk consumes every edge in it
+    -- to reject the cases where two cycles overlap but their symmetric
+    difference splits into more than one disjoint loop (which would not be
+    representable as one cyclic node list).
+    """
+    cycles = [list(c) for c in cycles]
+    cyc_edges: list[set[frozenset]] = [
+        {frozenset((c[i], c[(i + 1) % len(c)])) for i in range(len(c))} for c in cycles
+    ]
+
+    for _ in range(max_passes):
+        edge_to_cycles: dict[frozenset, list[int]] = {}
+        for idx, edges in enumerate(cyc_edges):
+            for e in edges:
+                edge_to_cycles.setdefault(e, []).append(idx)
+
+        n_swaps = 0
+        for a in sorted(range(len(cycles)), key=lambda i: -len(cycles[i])):
+            candidates: set[int] = set()
+            for e in cyc_edges[a]:
+                candidates.update(edge_to_cycles[e])
+            candidates.discard(a)
+
+            for b in candidates:
+                if len(cycles[b]) >= len(cycles[a]):
+                    continue
+
+                sym_diff = cyc_edges[a] ^ cyc_edges[b]
+                if not sym_diff or len(sym_diff) >= len(cycles[a]):
+                    continue
+
+                degree: dict[Any, int] = {}
+                touches_only_degree_2 = True
+                for e in sym_diff:
+                    u, v = tuple(e)
+                    degree[u] = degree.get(u, 0) + 1
+                    degree[v] = degree.get(v, 0) + 1
+                    if degree[u] > 2 or degree[v] > 2:
+                        touches_only_degree_2 = False
+                        break
+                if not touches_only_degree_2 or any(d != 2 for d in degree.values()):
+                    continue
+
+                new_cycle = _edges_to_cycle_order(list(sym_diff))
+                if len(new_cycle) != len(sym_diff):
+                    continue  # sym_diff is several disjoint loops, not one
+
+                for e in cyc_edges[a]:
+                    edge_to_cycles[e].remove(a)
+                cycles[a] = new_cycle
+                cyc_edges[a] = sym_diff
+                for e in sym_diff:
+                    edge_to_cycles.setdefault(e, []).append(a)
+                n_swaps += 1
+                break  # cycle `a` changed; re-evaluate it on the next pass
+
+        if n_swaps == 0:
+            break
+
+    return cycles
+
+
+def _topology_fingerprint(sub_network: SubNetwork) -> str:
+    """
+    Content hash of a sub-network's active branch topology (component, name,
+    bus0, bus1), independent of branch ordering.
+
+    Used to cache the cycle basis: it is purely a function of which buses
+    are connected by which branches, not of impedance or capacity values, so
+    it is safe to reuse across repeated ``determine_network_topology`` calls
+    (e.g. every outer iteration of
+    ``optimize_transmission_expansion_iteratively``, which rebuilds the
+    sub-networks and their KVL cycle basis on every solve via
+    ``pypsa.optimization.constraints.kirchhoff_voltage_cycles``) as long as
+    the branch set hasn't actually changed.
+    """
+    branches = sub_network.branches()
+    if branches.empty:
+        return "empty"
+    key = "|".join(
+        f"{idx}:{bus0}:{bus1}"
+        for idx, bus0, bus1 in sorted(
+            zip(map(str, branches.index), branches["bus0"], branches["bus1"]),
+        )
+    )
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
 def find_cycles(sub_network: SubNetwork, weight: str = "x_pu") -> None:
     """
     Find all cycles in the sub_network and record them in sub_network.C.
@@ -1415,15 +1657,40 @@ def find_cycles(sub_network: SubNetwork, weight: str = "x_pu") -> None:
     where there are multiple lines between the same pairs of buses).
 
     Cycles with infinite impedance are skipped.
+
+    The cycle basis depends only on topology (which buses are connected by
+    which branches), never on impedance/capacity values, so it is cached on
+    the parent network keyed by a topology fingerprint: repeated calls with
+    an unchanged branch set (e.g. successive outer iterations of
+    ``optimize_transmission_expansion_iteratively``, which only update
+    impedances/capacities) reuse the cached basis instead of recomputing it.
+
+    The basis is built in two purely topological, impedance-independent
+    steps ("bfs-refined"): ``_multi_root_bfs_cycles`` picks the best of a
+    handful of breadth-first spanning trees, then ``_pairwise_exchange_refine``
+    greedily shrinks it further by local basis exchange. Both are cheap --
+    a few seconds even for a sub-network with thousands of independent
+    cycles -- and only ever replace basis cycles with verified-independent,
+    verified-simple-cycle equivalents, so neither changes the cycle space
+    or the KVL constraints it defines; they only shrink the worst-case row.
     """
     branches_bus0 = sub_network.branches()["bus0"]
     branches_i = branches_bus0.index
+
+    n = sub_network.network
+    cache = n.__dict__.setdefault("_cycle_basis_cache", {})
+    fingerprint = _topology_fingerprint(sub_network)
+
+    if fingerprint in cache:
+        sub_network.C = cache[fingerprint].copy()
+        return
 
     # reduce to a non-multi-graph for cycles with > 2 edges
     mgraph = sub_network.graph(weight=weight, inf_weight=False)
     graph = nx.Graph(mgraph)
 
-    cycles = nx.cycle_basis(graph)
+    cycles = _multi_root_bfs_cycles(graph)
+    cycles = _pairwise_exchange_refine(cycles)
 
     # number of 2-edge cycles
     num_multi = len(mgraph.edges()) - len(graph.edges())
@@ -1454,6 +1721,8 @@ def find_cycles(sub_network: SubNetwork, weight: str = "x_pu") -> None:
                 sub_network.C[first_i, c] = 1
                 sub_network.C[b_i, c] = sign
                 c += 1
+
+    cache[fingerprint] = sub_network.C.copy()
 
 
 def sub_network_lpf(

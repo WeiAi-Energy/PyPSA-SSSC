@@ -70,9 +70,9 @@ DEFAULT_LINE_STRATEGIES = dict(
     terrain_factor="mean",
     s_min_pu="capacity_weighted_average",
     s_max_pu="capacity_weighted_average",
-    s_nom=pd.Series.sum,  # resolve infinities, see https://github.com/pandas-dev/pandas/issues/54161
-    s_nom_min="sum",
-    s_nom_max=pd.Series.sum,  # resolve infinities, see https://github.com/pandas-dev/pandas/issues/54161
+    s_nom="parallel_bottleneck",
+    s_nom_min="parallel_bottleneck",
+    s_nom_max="parallel_bottleneck",
     s_nom_extendable="any",
     num_parallel="sum",
     capital_cost="length_capacity_weighted_average",
@@ -435,6 +435,66 @@ def aggregatelines(
     voltage_factor = (orig_v_nom / v_nom) ** 2
     capacity_weights = df.groupby(grouper).s_nom.transform(normed_or_uniform)
 
+    # Susceptance of each original circuit, referred to the aggregate's voltage
+    # base but keeping its own reactance -- this is what divides flow between
+    # the circuits in the network being aggregated away, and so what decides
+    # which of them saturates first.  Deliberately *not* the ``length_factor``
+    # rescaled susceptance the impedance strategy below sums to get
+    # ``1 / x_agg``: that factor normalises the aggregate's impedance to the
+    # great-circle distance between the clustered buses, a property of where
+    # the cluster centroids land rather than of the original circuits.  Feeding
+    # it into the split would also cancel the very quantity the split turns on,
+    # since ``x_i`` runs roughly proportional to ``length_i``: every circuit in
+    # a group would come out with the same susceptance and the rating below
+    # would collapse to ``group size * smallest rating``.
+    #
+    # Taken here because the strategy loop overwrites ``x`` in place.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        susceptance = voltage_factor / pd.to_numeric(df.x, errors="coerce")
+    susceptance = susceptance.replace([np.inf, -np.inf], np.nan)
+    # Dividing flow by susceptance only means something where every circuit in
+    # the group has a usable one, and only bites for genuinely parallel groups.
+    divides_by_susceptance = susceptance.gt(0).groupby(grouper).transform("all") & (
+        susceptance.groupby(grouper).transform("size") > 1
+    )
+
+    def parallel_bottleneck(capacity: Series) -> Series:
+        """
+        Rate a group of parallel circuits by the first one to saturate.
+
+        Flow divides between parallel branches in proportion to susceptance, so
+        branch ``i`` reaches its own rating once the group as a whole carries
+        ``s_i / b_i * sum_j b_j``.  Absent any power-flow control the corridor
+        is held to whichever branch gets there first::
+
+            s_agg = sum_j b_j * min_i (s_i / b_i)
+
+        which equals the plain sum when every branch carries the same
+        rating-per-susceptance -- identical circuits being the usual case -- and
+        is strictly below it otherwise (``min_i s_i / b_i <= s_j / b_j`` for
+        every ``j``, so the product is bounded by ``sum_j s_j``).  Summing instead
+        credits a corridor with transfer capability that no uncontrolled DC
+        power flow can reach -- reaching it takes series compensation or another
+        flow-control device, which the aggregate no longer represents.
+
+        Circuits carrying a non-positive rating are read as missing data rather
+        than as a corridor rated at zero, so they do not set the bottleneck; the
+        result is still capped at the pooled rating so they cannot inflate it
+        either.  Groups of one pass through untouched, and infinities propagate:
+        an all-``inf`` group stays ``inf``.
+
+        The returned series is constant within each group.
+        """
+        capacity = pd.to_numeric(capacity, errors="coerce")
+        # `Series.sum` rather than "sum": the fast path mishandles infinities,
+        # see https://github.com/pandas-dev/pandas/issues/54161.
+        pooled = capacity.groupby(grouper).transform(Series.sum)
+        headroom = (capacity / susceptance).where(capacity > 0)
+        headroom = headroom.groupby(grouper).transform("min")
+        bottleneck = susceptance.groupby(grouper).transform("sum") * headroom
+        bottleneck = bottleneck.clip(upper=pooled)
+        return bottleneck.where(divides_by_susceptance & bottleneck.notna(), pooled)
+
     for col, strategy in static_strategies.items():
         if strategy == "capacity_weighted_average":
             df[col] = df[col] * capacity_weights
@@ -448,6 +508,9 @@ def aggregatelines(
         elif strategy == "length_capacity_weighted_average":
             df[col] = df[col] * length_factor * capacity_weights
             static_strategies[col] = "sum"
+        elif strategy == "parallel_bottleneck":
+            df[col] = parallel_bottleneck(df[col])
+            static_strategies[col] = "first"  # constant within group by construction
 
     df = df.groupby(grouper).agg(static_strategies)
 

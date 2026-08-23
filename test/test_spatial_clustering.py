@@ -11,6 +11,7 @@ import pytest
 
 import pypsa
 from pypsa.clustering.spatial import (
+    aggregatelines,
     aggregateoneport,
     busmap_by_hac,
     busmap_by_kmeans,
@@ -238,3 +239,92 @@ def test_custom_line_groupers(scipy_network):
     nc = C.network
     assert len(nc.buses) == 20
     assert (n.lines.groupby(linemap).build_year.nunique() == 1).all()
+
+
+def _two_parallel_circuits(x1, x2, s1, s2, length1=111.0, length2=111.0):
+    """Two circuits that a busmap turns into one parallel corridor A-B."""
+    n = pypsa.Network()
+    for bus, x in (("A1", 0.0), ("A2", 0.0), ("B1", 1.0), ("B2", 1.0)):
+        n.add("Bus", bus, x=x, y=0.0, v_nom=230.0)
+    n.add("Line", "l1", bus0="A1", bus1="B1", x=x1, r=0.0, s_nom=s1, length=length1)
+    n.add("Line", "l2", bus0="A2", bus1="B2", x=x2, r=0.0, s_nom=s2, length=length2)
+    busmap = pd.Series({"A1": "A", "A2": "A", "B1": "B", "B2": "B"})
+    return n, busmap
+
+
+def test_aggregate_lines_rating_is_set_by_the_bottleneck_circuit():
+    # Flow divides 3:1, so the stiffer circuit saturates while the other is at
+    # a third of its rating: the corridor is worth 400/3 MW, not 200 MW.
+    n, busmap = _two_parallel_circuits(1.0, 3.0, 100.0, 100.0)
+    lines, _, _ = aggregatelines(n, busmap, with_time=False)
+
+    assert len(lines) == 1
+    assert np.isclose(lines.s_nom.iloc[0], 400 / 3)
+    assert lines.s_nom.iloc[0] < n.lines.s_nom.sum()
+
+
+def test_aggregate_lines_rating_matches_where_the_power_flow_saturates():
+    n, busmap = _two_parallel_circuits(1.0, 3.0, 100.0, 100.0)
+    s_nom = aggregatelines(n, busmap, with_time=False)[0].s_nom.iloc[0]
+
+    # Tie the terminals together so the two circuits are genuinely parallel,
+    # then push exactly the aggregate rating through and read the loadings.
+    n.add("Line", "tieA", bus0="A1", bus1="A2", x=1e-6, r=0.0, s_nom=1e6, length=1.0)
+    n.add("Line", "tieB", bus0="B1", bus1="B2", x=1e-6, r=0.0, s_nom=1e6, length=1.0)
+    n.add("Generator", "g", bus="A1", p_nom=1e6, p_set=s_nom)
+    n.add("Load", "d", bus="B1", p_set=s_nom)
+    n.lpf()
+
+    loading = n.lines_t.p0.iloc[0][["l1", "l2"]].abs() / 100.0
+    assert np.isclose(loading.max(), 1.0, atol=1e-4)  # first circuit exactly full
+    assert loading.min() < 1.0  # the other still has headroom
+
+
+def test_aggregate_lines_identical_circuits_still_pool():
+    n, busmap = _two_parallel_circuits(2.0, 2.0, 100.0, 100.0)
+    lines, _, _ = aggregatelines(n, busmap, with_time=False)
+    assert np.isclose(lines.s_nom.iloc[0], 200.0)
+
+
+def test_aggregate_lines_rating_never_exceeds_the_pooled_rating():
+    # A circuit rated zero reads as missing data, not as a corridor rated zero,
+    # but it must not inflate the corridor past what the ratings add up to.
+    n, busmap = _two_parallel_circuits(1.0, 1.0, 100.0, 0.0)
+    lines, _, _ = aggregatelines(n, busmap, with_time=False)
+    assert np.isclose(lines.s_nom.iloc[0], 100.0)
+
+
+def test_aggregate_lines_infinite_expansion_limit_survives():
+    n, busmap = _two_parallel_circuits(1.0, 3.0, 100.0, 100.0)
+    n.lines["s_nom_max"] = np.inf
+    lines, _, _ = aggregatelines(n, busmap, with_time=False)
+    assert np.isinf(lines.s_nom_max.iloc[0])
+
+
+def test_aggregate_lines_single_circuit_is_untouched():
+    n, busmap = _two_parallel_circuits(1.0, 3.0, 100.0, 100.0)
+    n.remove("Line", "l2")
+    lines, _, _ = aggregatelines(n, busmap, with_time=False)
+    assert lines.s_nom.iloc[0] == 100.0
+
+
+def test_aggregate_lines_rating_ignores_the_clustered_length():
+    # Circuits of very different length, with reactance running proportional to
+    # it as real conductor data does.  Flow splits 10:1 towards the short one,
+    # which saturates at 110 MW for the corridor.  Rescaling the susceptances to
+    # the clustered buses' great-circle distance first would divide out the
+    # length, leave both circuits looking equally stiff, and hand back the plain
+    # 200 MW sum -- the rating has to turn on the reactances the pre-aggregation
+    # network actually splits flow by.
+    n, busmap = _two_parallel_circuits(0.3, 3.0, 100.0, 100.0, 30.0, 300.0)
+    lines, _, _ = aggregatelines(n, busmap, with_time=False)
+    assert np.isclose(lines.s_nom.iloc[0], 110.0)
+
+    n.add("Line", "tieA", bus0="A1", bus1="A2", x=1e-7, r=0.0, s_nom=1e7, length=1.0)
+    n.add("Line", "tieB", bus0="B1", bus1="B2", x=1e-7, r=0.0, s_nom=1e7, length=1.0)
+    n.add("Generator", "g", bus="A1", p_nom=1e7, p_set=110.0)
+    n.add("Load", "d", bus="B1", p_set=110.0)
+    n.lpf()
+    loading = n.lines_t.p0.iloc[0][["l1", "l2"]].abs() / 100.0
+    assert np.isclose(loading.max(), 1.0, atol=1e-4)
+    assert loading.min() < 1.0
