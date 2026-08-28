@@ -5,16 +5,22 @@ Build optimisation problems from PyPSA networks with Linopy.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from collections.abc import Callable, Sequence
 from functools import wraps
+from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
+import xarray as xr
 from linopy import Model, merge
+from linopy.constants import Status
 from linopy.solvers import available_solvers
+from scipy.sparse.linalg import spsolve
 
 from pypsa.descriptors import additional_linkports, get_committable_i, nominal_attrs
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
@@ -394,9 +400,15 @@ def assign_solution(n: Network) -> None:
 
         try:
             c, attr = name.split("-", 1)
-            df = sol.to_pandas()
         except ValueError:
             continue
+        # Extra-functionality callbacks may add auxiliary variables whose
+        # names are not component attributes. They belong to the optimization
+        # model, but there is no network component table to which their
+        # solution should be assigned.
+        if c not in n.components:
+            continue
+        df = sol.to_pandas()
 
         if "snapshot" in sol.dims:
             if c in n.passive_branch_components and attr == "s":
@@ -416,7 +428,7 @@ def assign_solution(n: Network) -> None:
 
             else:
                 set_from_frame(n, c, attr, df)
-        elif attr != "n_mod":
+        elif attr != "n_mod" and hasattr(df, "index"):
             idx = df.index.intersection(n.df(c).index)
             n.df(c).loc[idx, attr + "_opt"] = df.loc[idx]
 
@@ -566,9 +578,14 @@ def post_processing(n: Network) -> None:
         if len(buses_i) == 1:
             return pd.DataFrame(0, index=sns, columns=buses_i)
         sub.calculate_B_H(skip_pre=True)
-        Z = pd.DataFrame(np.linalg.pinv((sub.B).todense()), buses_i, buses_i)
-        Z -= Z[sub.slack_bus]
-        return n.buses_t.p.reindex(columns=buses_i) @ Z
+        # buses_i[0] is always the slack bus (see `calculate_control_shift`), so
+        # solving the slack-reduced sparse system avoids ever densifying `sub.B`
+        # (a dense pinv of an (n_buses, n_buses) matrix is infeasible for large
+        # networks, e.g. 9+ GiB and an O(n^3) SVD for 35k buses).
+        p = n.buses_t.p.reindex(columns=buses_i).to_numpy()
+        v_ang = np.zeros((len(sns), len(buses_i)))
+        v_ang[:, 1:] = spsolve(sub.B[1:, 1:], p[:, 1:].T).T
+        return pd.DataFrame(v_ang, sns, buses_i)
 
     # TODO: if multi investment optimization, the network topology is not the necessarily the same,
     # i.e. one has to iterate over the periods in order to get the correct angles.
@@ -577,6 +594,254 @@ def post_processing(n: Network) -> None:
         n.buses_t.v_ang = pd.concat(
             [v_ang_for_(sub) for sub in n.sub_networks.obj], axis=1
         ).reindex(columns=n.buses.index, fill_value=0.0)
+
+
+_GUROBI_TERMINATION_CONDITIONS = {
+    1: "unknown",
+    2: "optimal",
+    3: "infeasible",
+    4: "infeasible_or_unbounded",
+    5: "unbounded",
+    6: "other",
+    7: "iteration_limit",
+    8: "terminated_by_limit",
+    9: "time_limit",
+    10: "optimal",
+    11: "user_interrupt",
+    12: "other",
+    13: "suboptimal",
+    14: "unknown",
+    15: "terminated_by_limit",
+    16: "internal_solver_error",
+    17: "internal_solver_error",
+}
+
+
+def _int_index_from_names(named_values: dict[str, float]) -> pd.Series:
+    """
+    Map Gurobi variable/constraint names (``x0``, ``x1``, ... or ``c0``, ...)
+    back to the integer Linopy label they were generated from.
+
+    Mirrors ``linopy.common.set_int_index`` without importing it directly:
+    that helper is internal and its module layout has changed across Linopy
+    releases, whereas the plain (name, value) pairs read from Gurobi via
+    ``getVars``/``getConstrs`` are stable.
+    """
+    series = pd.Series(named_values, dtype=float)
+    if series.empty or pd.api.types.is_integer_dtype(series.index):
+        return series
+    cutoff = sum(1 for ch in str(series.index[0]) if ch.isalpha())
+    try:
+        series.index = series.index.str[cutoff:].astype(int)
+    except ValueError:
+        series.index = series.index.str.replace(".*#", "", regex=True).astype(int)
+    return series
+
+
+def _solve_model_with_selected_variables(
+    n: Network,
+    m: Model,
+    selected_variables: Sequence[str],
+    solver_name: str,
+    solver_options: dict[str, Any],
+    **kwargs: Any,
+) -> tuple[str, str]:
+    """
+    Solve a Gurobi model and read back only selected primal variable groups.
+
+    This is an internal fast path for outer algorithms which need a small
+    subset of the primal solution but neither duals nor a fully populated
+    :class:`linopy.Model`. Other solvers retain Linopy's standard behaviour.
+
+    On a successful Gurobi solve, ``n._pending_full_solve`` is set to an
+    object exposing ``finish()`` and ``discard()``. A caller who later decides
+    the partial solution is not enough can call ``finish()`` to complete the
+    solve from the *same* already-solved Gurobi model - every remaining
+    primal variable and every dual, mapped exactly as a full ``m.solve()``
+    would - without a second call to Gurobi's ``optimize``. ``discard()``
+    instead releases the retained Gurobi handles when the partial solution
+    turned out to be enough. Exactly one of the two must be called before the
+    model is solved again. On any other path (solve failure, non-Gurobi
+    solver, missing bindings) ``n._pending_full_solve`` is ``None`` and there
+    is nothing to release.
+    """
+    n._pending_full_solve = None
+
+    if solver_name != "gurobi" or kwargs.get("remote") is not None:
+        return m.solve(solver_name=solver_name, **solver_options, **kwargs)
+
+    try:
+        import gurobipy
+    except ImportError:
+        logger.warning(
+            "Gurobi Python bindings are unavailable; falling back to the full "
+            "Linopy solution import."
+        )
+        return m.solve(solver_name=solver_name, **solver_options, **kwargs)
+
+    m.matrices.clean_cached_properties()
+    m.reset_solution()
+
+    io_api = kwargs.pop("io_api", None)
+    problem_fn = kwargs.pop("problem_fn", None)
+    solution_fn = kwargs.pop("solution_fn", None)
+    log_fn = kwargs.pop("log_fn", None)
+    basis_fn = kwargs.pop("basis_fn", None)
+    warmstart_fn = kwargs.pop("warmstart_fn", None)
+    keep_files = kwargs.pop("keep_files", False)
+    env = kwargs.pop("env", None)
+    sanitize_zeros = kwargs.pop("sanitize_zeros", True)
+    kwargs.pop("remote", None)
+
+    if io_api not in (None, "lp", "lp-polars", "mps", "direct"):
+        raise ValueError(
+            "Keyword argument `io_api` has to be one of "
+            "'lp', 'lp-polars', 'mps', 'direct' or None"
+        )
+
+    if problem_fn is None:
+        problem_fn = m.get_problem_file(io_api=io_api)
+    problem_path = Path(problem_fn)
+
+    if sanitize_zeros:
+        m.constraints.sanitize_zeros()
+
+    # The Gurobi handles (env, in-memory model) are kept open past this
+    # function on success, so that a caller who ends up needing the complete
+    # solution can read it from the model already solved here instead of
+    # solving it a second time. They are released by whichever of
+    # ``finish``/``discard`` the caller calls, or immediately below on
+    # failure.
+    stack = contextlib.ExitStack()
+
+    def release() -> None:
+        stack.close()
+        if problem_path.exists() and not keep_files:
+            problem_path.unlink()
+
+    try:
+        if env is None:
+            env = stack.enter_context(gurobipy.Env())
+
+        if io_api is None or io_api in ("lp", "lp-polars", "mps"):
+            problem_path = m.to_file(problem_path, io_api=io_api)
+            solver_model = gurobipy.read(str(problem_path), env=env)
+        else:
+            solver_model = m.to_gurobipy(env=env)
+
+        for key, value in {**solver_options, **kwargs}.items():
+            solver_model.setParam(key, value)
+        if log_fn is not None:
+            solver_model.setParam("logfile", str(log_fn))
+        if warmstart_fn is not None:
+            solver_model.read(str(warmstart_fn))
+
+        solver_model.optimize()
+
+        if basis_fn is not None:
+            try:
+                solver_model.write(str(basis_fn))
+            except gurobipy.GurobiError as err:
+                logger.info("No model basis stored. Raised error: %s", err)
+        if solution_fn is not None and Path(solution_fn).suffix == ".sol":
+            try:
+                solver_model.write(str(solution_fn))
+            except gurobipy.GurobiError as err:
+                logger.info("Unable to save solution file. Raised error: %s", err)
+
+        condition = _GUROBI_TERMINATION_CONDITIONS.get(
+            solver_model.status, str(solver_model.status)
+        )
+        status = Status.from_termination_condition(condition)
+
+        m.status = status.status.value
+        m.termination_condition = status.termination_condition.value
+        m.solver_name = solver_name
+        m.solver_model = None
+
+        if not status.is_ok:
+            release()
+            return m.status, m.termination_condition
+
+        m.objective._value = float(solver_model.ObjVal)
+        for name in selected_variables:
+            if name not in m.variables:
+                continue
+            variable = m.variables[name]
+            labels = np.asarray(variable.labels.values)
+            values = np.full(labels.size, np.nan)
+            valid = labels.ravel() >= 0
+            if valid.any():
+                solver_variables = [
+                    solver_model.getVarByName(f"x{label}")
+                    for label in labels.ravel()[valid]
+                ]
+                if any(v is None for v in solver_variables):
+                    raise RuntimeError(
+                        f"Could not retrieve Gurobi variables for Linopy group {name!r}."
+                    )
+                values[valid] = solver_model.getAttr("X", solver_variables)
+            variable.solution = xr.DataArray(
+                values.reshape(labels.shape), variable.coords
+            )
+    except BaseException:
+        release()
+        raise
+
+    called = False
+
+    def finish() -> None:
+        nonlocal called
+        if called:
+            return
+        called = True
+        sol = _int_index_from_names(
+            {v.VarName: v.X for v in solver_model.getVars()}
+        )
+        sol.loc[-1] = np.nan
+        for _, var in m.variables.items():
+            idx = np.ravel(var.labels)
+            try:
+                vals = sol[idx].values.reshape(var.labels.shape)
+            except KeyError:
+                vals = sol.reindex(idx).values.reshape(var.labels.shape)
+            var.solution = xr.DataArray(vals, var.coords)
+
+        try:
+            dual = _int_index_from_names(
+                {c.ConstrName: c.Pi for c in solver_model.getConstrs()}
+            )
+        except AttributeError:
+            logger.warning("Dual values of MILP couldn't be parsed")
+            dual = pd.Series(dtype=float)
+        if not dual.empty:
+            dual.loc[-1] = np.nan
+            for _, con in m.constraints.items():
+                idx = np.ravel(con.labels)
+                try:
+                    vals = dual[idx].values.reshape(con.labels.shape)
+                except KeyError:
+                    vals = dual.reindex(idx).values.reshape(con.labels.shape)
+                con.dual = xr.DataArray(vals, con.labels.coords)
+
+        m.solver_model = solver_model
+        release()
+
+    def discard() -> None:
+        nonlocal called
+        if called:
+            return
+        called = True
+        release()
+
+    n._pending_full_solve = SimpleNamespace(finish=finish, discard=discard)
+
+    logger.info(
+        "Optimization successful: imported %d selected primal variable group(s) "
+        "without duals.",
+        sum(name in m.variables for name in selected_variables),
+    )
+    return m.status, m.termination_condition
 
 
 def optimize(
@@ -592,6 +857,10 @@ def optimize(
     solver_options: dict = {},
     compute_infeasibilities: bool = False,
     include_objective_constant: bool = False,
+    _solution_variables: Sequence[str] | None = None,
+    _assign_solution: bool = True,
+    _assign_duals: bool = True,
+    _post_processing: bool = True,
     **kwargs: Any,
 ) -> tuple[str, str]:
     """
@@ -667,12 +936,28 @@ def optimize(
     )
     if extra_functionality:
         extra_functionality(n, sns)
-    status, condition = m.solve(solver_name=solver_name, **solver_options, **kwargs)
+    if _solution_variables is None:
+        n._pending_full_solve = None
+        status, condition = m.solve(
+            solver_name=solver_name, **solver_options, **kwargs
+        )
+    else:
+        status, condition = _solve_model_with_selected_variables(
+            n,
+            m,
+            _solution_variables,
+            solver_name,
+            solver_options,
+            **kwargs,
+        )
 
     if status == "ok":
-        assign_solution(n)
-        assign_duals(n, assign_all_duals)
-        post_processing(n)
+        if _assign_solution:
+            assign_solution(n)
+        if _assign_duals:
+            assign_duals(n, assign_all_duals)
+        if _post_processing:
+            post_processing(n)
 
     if (
         condition == "infeasible"
@@ -779,6 +1064,20 @@ class OptimizationAccessor:
     @wraps(optimize_mga)
     def optimize_mga(self, *args: Any, **kwargs: Any) -> Any:
         return optimize_mga(self._parent, *args, **kwargs)
+
+    def certify_expansion(self, *args: Any, **kwargs: Any) -> Any:
+        """
+        Bound the transmission expansion problem this network poses from below.
+
+        See :func:`pypsa.optimization.lower_bound.certify_expansion`. The
+        capacity dependence of the impedance is written around the reference
+        data of this network, so call it on the network as it went into
+        ``optimize_transmission_expansion_iteratively`` and pass the plan to
+        certify, or on one whose ``_s_nom_def`` matches its impedances.
+        """
+        from pypsa.optimization.lower_bound import certify_expansion
+
+        return certify_expansion(self._parent, *args, **kwargs)
 
     def fix_optimal_capacities(self) -> None:
         """

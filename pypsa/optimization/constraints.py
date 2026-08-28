@@ -775,7 +775,7 @@ def define_kirchhoff_voltage_constraints(n: Network, sns: pd.Index) -> None:
     sensitivities :math:`\\alpha` are provided as a DataFrame with the
     snapshots as index and ``(component, name)`` pairs as columns by
     ``optimize_transmission_expansion_iteratively`` with
-    ``method='trust_region'``. Without them, the capacity dependence of the
+    ``scheme='slp'``. Without them, the capacity dependence of the
     impedance is only resolved by the outer fixed-point iteration.
     """
     m = n.model

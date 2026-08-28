@@ -627,40 +627,54 @@ in the ordinary optimization, however
 covers this through an iterative process as done `Hagspiel et al. (2014)
 <http://www.sciencedirect.com/science/article/pii/S0360544214000322#>`_.
 
-Two schemes are available through the ``method`` argument:
+Two schemes are available through the ``scheme`` argument:
 
-``method="fixed_point"`` (default)
+``scheme="slp"`` (default)
+    Sequential linear programming: the voltage law additionally carries the
+    first-order sensitivity of its branch terms with respect to the branch
+    capacity, so each inner problem accounts for the change of the voltage law
+    its own step causes. It typically needs considerably fewer iterations than
+    the fixed point, and it converges on meshed networks where the fixed-point
+    iteration oscillates.
+
+``scheme="fixed_point"``
     The impedance, and with it the Kirchhoff voltage law, is frozen at the
     capacity of the previous iterate. This is the plain fixed-point iteration
     of Hagspiel et al. (2014).
 
-``method="trust_region"``
-    The voltage law additionally carries the first-order sensitivity of its
-    branch terms with respect to the branch capacity, and the capacities are
-    restricted to a trust region around the linearisation point whose radius is
-    adapted to the observed linearisation error. This sequential linear
-    programming scheme typically needs considerably fewer iterations, and it
-    converges on meshed networks where the fixed-point iteration oscillates.
+A linearisation is only valid over a limited step, and two step controls bound
+it. They are independent of each other and of the scheme, and both are adapted
+during the iteration:
+
+``trust_region=True`` (default)
+    Restricts the capacities of each inner problem to a box around the previous
+    iterate, whose radius is adapted to the observed linearisation error. It is
+    the only control that bounds the step hard and the only one that can reject
+    a step and re-solve it, which makes it a safeguard rather than a preference.
+
+``proximal="l1"`` or ``proximal="l2"``
+    Adds a penalty on moving a branch capacity away from the previous iterate,
+    in units of that branch's capital cost. The default ``"l2"`` weight is
+    fixed at 0.5; it can be made adaptive by passing wider ``proximal_bounds``.
+    It also resolves the degeneracy that lets equal-cost plans
+    exchange capacity between branches. ``"l2"`` keeps the objective's optimality
+    conditions exact at the anchor at the price of a quadratic inner problem;
+    ``"l1"`` keeps the inner problem linear but has a dead zone, so its weight is
+    capped an order of magnitude lower and it cannot serve as the only control.
 
 Both schemes stop once the **system cost** has changed by less than
 ``cost_threshold`` (default ``1e-5``) in each of the last ``cost_window``
-(default ``3``) iterations. The relative change of the transmission capacities,
+(default ``2``) iterations. The relative change of the transmission capacities,
 which earlier versions used as criterion, is only reported as a diagnostic: it
 is a step size rather than a measure of convergence, and on meshed networks
 degenerate alternative optima keep it bouncing long after the solution has
 settled, while a small step can occur by accident.
 
-``proximal_weight`` adds a proximal term
-:math:`\delta \sum_\ell c_\ell |F_\ell - F_\ell'|` to the objective, which
-penalises moving the capacity of a branch away from the previous iterate
-:math:`F'` in units of its capital cost. It damps the iteration and resolves the
-degeneracy that lets equal-cost solutions exchange capacity between branches.
-The term vanishes at the fixed point and is excluded from the reported cost.
-
-The convergence history of both schemes is written to ``n.iteration_log``, which
-reports per iteration the system cost and its relative change, the relative
-change of the transmission capacities, the residual of the exact voltage law,
-and, for the trust region scheme, its radius and whether the step was accepted.
+The convergence history is written to ``n.iteration_log``, which reports per
+iteration the system cost and its relative change, the relative change of the
+transmission capacities, the residual of the exact voltage law, the trust region
+radius and whether it was binding, the weight of the proximal term, and whether
+the step was accepted.
 
 
 Security-Constrained Power Flow
