@@ -75,7 +75,7 @@ DEFAULT_LINE_STRATEGIES = dict(
     s_nom_max="parallel_bottleneck",
     s_nom_extendable="any",
     num_parallel="sum",
-    capital_cost="length_capacity_weighted_average",
+    capital_cost="capacity_weighted_average",
     v_ang_min="max",
     v_ang_max="min",
     lifetime="capacity_weighted_average",
@@ -360,7 +360,6 @@ def aggregatebuses(
 def aggregatelines(
     n: Network,
     busmap: dict,
-    line_length_factor: float = 1.0,
     with_time: bool = True,
     custom_strategies: dict | None = None,
     bus_strategies: dict | None = None,
@@ -375,8 +374,6 @@ def aggregatelines(
         The network containing the lines.
     busmap : dict
         A dictionary mapping old bus IDs to new bus IDs.
-    line_length_factor : float, optional
-        A factor to multiply the length of each line by (default is 1.0).
     with_time : bool, optional
         Whether to aggregate dynamic data (default is True).
     custom_strategies : dict, optional
@@ -405,8 +402,10 @@ def aggregatelines(
     orig_length = df.length
     orig_v_nom = df.bus0.map(n.buses.v_nom)
 
+    # Only ``v_nom`` is needed: the aggregate's length comes from the circuits
+    # themselves, not from where the clustered buses sit.
     bus_strategies = {**DEFAULT_BUS_STRATEGIES, **bus_strategies}
-    cols = ["x", "y", "v_nom"]
+    cols = ["v_nom"]
     buses = n.buses[cols].groupby(busmap).agg({c: bus_strategies[c] for c in cols})
 
     df = df.assign(bus0=df.bus0.map(busmap), bus1=df.bus1.map(busmap))
@@ -422,10 +421,20 @@ def aggregatelines(
 
     grouper = df.groupby(["bus0", "bus1", *custom_line_groupers]).ngroup().astype(str)
 
-    coords = buses[["x", "y"]]
-    length = (
-        haversine_pts(coords.loc[df.bus0], coords.loc[df.bus1]) * line_length_factor
-    )
+    capacity_weights = df.groupby(grouper).s_nom.transform(normed_or_uniform)
+
+    # The aggregate keeps the routed length of the circuits it stands for -- an
+    # ``s_nom``-weighted mean over the group -- rather than the great-circle
+    # distance between the clustered buses.  Cluster centroids are an artefact of
+    # where the busmap happened to put its boundaries; the conductor that has to
+    # be built is the one that exists.  Weighting by ``s_nom`` lets the circuits
+    # actually carrying the corridor set its length, and `normed_or_uniform`
+    # falls back to a plain mean for a group with no usable rating.
+    #
+    # Computed with `transform` so the value is constant within each group: the
+    # `length` column carries no strategy of its own and is reduced by
+    # `make_consense`, which requires exactly that.
+    length = (orig_length * capacity_weights).groupby(grouper).transform("sum")
     df = df.assign(length=length)
 
     length_factor = (df.length / orig_length).where(orig_length > 0, df.length)
@@ -433,20 +442,14 @@ def aggregatelines(
         1
     )
     voltage_factor = (orig_v_nom / v_nom) ** 2
-    capacity_weights = df.groupby(grouper).s_nom.transform(normed_or_uniform)
 
     # Susceptance of each original circuit, referred to the aggregate's voltage
     # base but keeping its own reactance -- this is what divides flow between
     # the circuits in the network being aggregated away, and so what decides
-    # which of them saturates first.  Deliberately *not* the ``length_factor``
-    # rescaled susceptance the impedance strategy below sums to get
-    # ``1 / x_agg``: that factor normalises the aggregate's impedance to the
-    # great-circle distance between the clustered buses, a property of where
-    # the cluster centroids land rather than of the original circuits.  Feeding
-    # it into the split would also cancel the very quantity the split turns on,
-    # since ``x_i`` runs roughly proportional to ``length_i``: every circuit in
-    # a group would come out with the same susceptance and the rating below
-    # would collapse to ``group size * smallest rating``.
+    # which of them saturates first.  It is exactly the quantity the impedance
+    # strategy below sums to get ``1 / x_agg``, so the rating and the impedance
+    # of the aggregate are built from one and the same susceptance: no length
+    # rescaling stands between them.
     #
     # Taken here because the strategy loop overwrites ``x`` in place.
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -500,13 +503,13 @@ def aggregatelines(
             df[col] = df[col] * capacity_weights
             static_strategies[col] = "sum"
         elif strategy == "reciprocal_voltage_weighted_average":
-            df[col] = voltage_factor / (length_factor * df[col])
+            # No ``length_factor``: the aggregate stands for the circuits as
+            # they are, so their impedances combine in parallel at the shared
+            # voltage base and are not renormalised to the aggregate's length.
+            df[col] = voltage_factor / df[col]
             static_strategies[col] = lambda x: 1.0 / x.sum()
         elif strategy == "voltage_weighted_average":
             df[col] = voltage_factor * length_factor * df[col]
-            static_strategies[col] = "sum"
-        elif strategy == "length_capacity_weighted_average":
-            df[col] = df[col] * length_factor * capacity_weights
             static_strategies[col] = "sum"
         elif strategy == "parallel_bottleneck":
             df[col] = parallel_bottleneck(df[col])
@@ -573,7 +576,6 @@ def get_clustering_from_busmap(
     lines, lines_t, linemap = aggregatelines(
         n,
         busmap,
-        line_length_factor,
         with_time=with_time,
         custom_strategies=line_strategies,
         bus_strategies=bus_strategies,
@@ -767,7 +769,8 @@ def kmeans_clustering(
         Final number of clusters desired.
     line_length_factor : float
         Factor to multiply the spherical distance between new buses in order to get new
-        line lengths.
+        *link* lengths.  Lines take an ``s_nom``-weighted mean of the lengths of the
+        circuits they replace and ignore it.
     kwargs
         Any remaining arguments to be passed to KMeans (e.g. n_init, n_jobs)
 
@@ -914,7 +917,9 @@ def hac_clustering(
         - ‘complete’ or ‘maximum’ linkage uses the maximum distances between all observations of the two sets.
         - ‘single’ uses the minimum of the distances between all observations of the two sets.
     line_length_factor: float, default=1.0
-        Factor to multiply the spherical distance between two new buses in order to get new line lengths.
+        Factor to multiply the spherical distance between two new buses in order to get
+        new *link* lengths.  Lines take an ``s_nom``-weighted mean of the lengths of the
+        circuits they replace and ignore it.
     kwargs:
         Any remaining arguments to be passed to Hierarchical Clustering (e.g. memory, connectivity).
 
@@ -1019,7 +1024,9 @@ def greedy_modularity_clustering(
     buses_i: None | pandas.Index, default=None
         Subset of buses to cluster. If None, all buses are considered.
     line_length_factor: float, default=1.0
-        Factor to multiply the spherical distance between two new buses to get new line lengths.
+        Factor to multiply the spherical distance between two new buses to get new *link*
+        lengths.  Lines take an ``s_nom``-weighted mean of the lengths of the circuits
+        they replace and ignore it.
 
     Returns
     -------

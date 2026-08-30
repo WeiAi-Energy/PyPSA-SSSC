@@ -96,7 +96,7 @@ def optimize_transmission_expansion_iteratively(
     proximal_metric: str = "capex",
     proximal_initial: float | None = None,
     proximal_bounds: tuple[float, float] | None = None,
-    trust_region_initial: float = 0.5,
+    trust_region_initial: float = 1.0,
     trust_region_bounds: tuple[float, float] = (1e-2, 1.0),
     trust_region_tolerances: tuple[float, float] = (1e-5, 1e-2),
     trust_region_factors: tuple[float, float] = (0.5, 2.0),
