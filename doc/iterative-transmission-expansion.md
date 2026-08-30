@@ -289,9 +289,9 @@ Intermediate iterations read back only the variable groups the outer loop needs
   same solved model, without a second call to the solver — and the full primal
   solution, the duals and the derived network time series are assigned from it.
   There is no re-solve at the converged point, unlike line 7 of Algorithm 1.
-* **Without convergence** (`max_iterations` exhausted, or the radius bottomed
-  out on a rejected step) the last attempted solve was discarded, so one further
-  solve is run at the last accepted capacities $F^{\mathrm{fix}}$, in the plain
+* **Without convergence** (`max_iterations` exhausted) the last attempted solve
+  was discarded, so one further
+  solve is run at the last capacities $F^{\mathrm{fix}}$, in the plain
   formulation (10d) — no sensitivities, no box — to obtain a fully populated
   network. If that solve fails, the status of the last successful loop solve is
   reported.
@@ -324,11 +324,10 @@ complementary:
   previous iterate, which is the one whose voltage law the linearisation still
   describes.
 
-Either control is enough to *reject* a step and re-solve at the same
-linearisation point, since the rejection is decided by the residual the step
-leaves (section 6.3) and not by which control is active. What the two do
-differently is how the re-solve is made to take a shorter step: on a smaller box,
-or under a heavier penalty.
+Neither control ever discards a solved step. A large residual (section 6.3)
+narrows the step the *next* iteration is allowed to take - on a smaller box, or
+under a heavier penalty - but the iterate that produced it is still taken as the
+next linearisation point.
 
 ### 6.1 Trust region (`trust_region=True`)
 
@@ -475,10 +474,13 @@ least one control is active and the iteration has not converged:
 
 | condition | action |
 | --- | --- |
-| $\hat{V}^n > \varepsilon_{\max}$ | reject the step, $\mathrm{tighten}$ |
+| $\hat{V}^n > \varepsilon_{\max}$ | accept, $\mathrm{tighten}$ — the linear model did not describe the step |
 | else if $\mathrm{step}^n \ge \mathrm{step}^{n-1}$ | accept, $\mathrm{tighten}$ — no progress, the model is trusted over too wide a range |
 | else if $\hat{V}^n \le \varepsilon_{\mathrm{tgt}}$ and (binding or a proximal term is active) | accept, $\mathrm{relax}$ |
 | otherwise | accept, both controls unchanged |
+
+Every row accepts: a solved iterate is never discarded, and the controls only
+set the width of the next step.
 
 The linearisation error $\hat{V}^n$ is only available where a linearisation is
 active; where it is not — the first iteration, and every iteration of the fixed
@@ -491,15 +493,14 @@ The proximal term has no such test: it is always "binding" in the sense that it
 always charges for the step it admits, so an acceptable error is enough to lower
 its weight.
 
-A step small enough to have converged the cost is always accepted: the
-linearisation then reproduces its own point, where the constraint coincides with
-the exact one. A rejected step leaves $F^{\mathrm{fix}}$ untouched, so the next
-iteration re-solves at the same linearisation point with a smaller radius and a
-heavier penalty, whichever of the two is active.
+At a converged point the linearisation reproduces its own point, where the
+constraint coincides with the exact one, so the controls are switched off there
+altogether.
 
-If every active control is exhausted — the radius at $\rho_{\min}$, the weight at
-$\delta_{\max}$ — on a step that had to be rejected, the iteration stops and
-reports the last accepted iterate.
+An active control that reaches its bound — the radius at $\rho_{\min}$, the
+weight at $\delta_{\max}$ — simply saturates there. The iteration continues at
+that width until the cost converges or `max_iterations` runs out; a large
+residual by itself never ends the run.
 
 ---
 
@@ -640,9 +641,9 @@ certified against a global optimum by `lower_bound.certify_expansion`
 Three things are being decided here, and the grid separates them.
 
 **The scheme.** No fixed-point configuration is the best plan on more than one
-of the 18 instances, and its step controls change nothing at all — the box never
-rejects a step, because without a linearisation there is no error to reject it
-on. Where it does converge it can converge to a genuinely worse point rather
+of the 18 instances, and its step controls change little — without a
+linearisation there is no error to adapt the radius on, only the progress of the
+fixed-point residual. Where it does converge it can converge to a genuinely worse point rather
 than merely stop early: on `F s20 c200` every fixed-point run *converges*, at
 6.3–6.8 % above the best plan and 6 % above the certified optimum. Hence
 `scheme="slp"`.
@@ -664,17 +665,19 @@ kept but is not the default.
 
 **The trust region.** Next to the $\ell_2$ term it is, on this system, inert:
 with $\ell_2$ active, on and off agree to $2.4\cdot10^{-6}$ in cost on 17 of the
-18 instances, and agree exactly in iterations, rejections and convergence. Its
+18 instances, and agree exactly in iterations and convergence. Its
 measurable value is elsewhere — it is what rescues $\ell_1$ (6/18 converged and
 5.65 % mean become 16/18 and 0.55 %), which is the degeneracy argument of
-section 6 in numbers. Note also that rejection is *not* what the box
-contributes: `slp` + $\ell_2$ with the box off still rejects 16 steps over the
-grid, because rejection is driven by the linearisation error and re-solving only
-needs *some* control to tighten. What is unique to the box is that the bound is
-hard. It is left on by default because it costs nothing measurable here, because
-it is the only hard bound, and because two active controls have to be exhausted
-rather than one before a rejected step ends the run; on this evidence
-`trust_region=False` is an entirely defensible choice.
+section 6 in numbers. What is unique to the box is that the bound is hard. It is
+left on by default because it costs nothing measurable here and because it is
+the only hard bound; on this evidence `trust_region=False` is an entirely
+defensible choice.
+
+> The grid above was measured while a step whose residual exceeded
+> $\varepsilon_{\max}$ was *discarded* and re-solved at the same linearisation
+> point. That rejection has since been removed — every solved iterate is now
+> kept, and a large residual only tightens the next step — so the counts and
+> gaps in the table predate the current step control and are indicative only.
 
 ---
 
@@ -710,17 +713,14 @@ while n ≤ n_max:
 
     converged ← cost stationary over cost_window iterations and n ≥ n_min
     binding   ← cost-weighted share at the boundary ≥ 0.1
-    if step control active and not converged:  accept / reject, tighten / relax
+    if step control active and not converged:  tighten / relax   # step is kept
 
-    if rejected:
-        if every active control exhausted: stop
-        n ← n+1; continue                              # same F_fix, smaller step
     F_fix ← clip(F*);  g_fix ← g*
     if converged:
         complete this iterate's solve in place and assign it;  return
     costs ← costs + [obj];  n ← n+1
 
-if not converged:                                      # n_max, or ρ bottomed out
+if not converged:                                      # n_max exhausted
     set branch impedances from F_fix
     solve once more, plain formulation (10d), no box, no penalty
 ```

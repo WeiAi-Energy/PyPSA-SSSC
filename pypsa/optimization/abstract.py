@@ -144,10 +144,9 @@ def optimize_transmission_expansion_iteratively(
         columns and objective scalars are retained as well. Complete primal
         results, duals and derived network time series are assigned from the
         iterate at which the loop converges; if it stops without converging
-        (``max_iterations`` exhausted, or the trust region radius bottoming
-        out), they come from one further solve at the last accepted
-        capacities instead, since no solved iterate is left to reuse in that
-        case.
+        (``max_iterations`` exhausted), they come from one further solve at the
+        last capacities of the iteration instead, since no solved iterate is
+        left to reuse in that case.
     scheme : {'slp', 'fixed_point'}, default 'slp'
         How the capacity dependence of the voltage law is resolved.
 
@@ -167,25 +166,26 @@ def optimize_transmission_expansion_iteratively(
             completed and returned directly, with no further re-solve.
 
         A linearisation is only valid over a limited step, which is what
-        ``trust_region`` and ``proximal`` are for. With both off, ``'slp'`` is a
-        bare Gauss-Newton iteration: there is nothing to retry a step with, so
-        every step is accepted however large the residual it leaves, and on a
-        meshed network it oscillates instead of converging.
+        ``trust_region`` and ``proximal`` are for. Every solved iterate is
+        accepted however large the residual it leaves; the controls only narrow
+        the *next* step. With both off, ``'slp'`` is a bare Gauss-Newton
+        iteration, and on a meshed network it oscillates instead of
+        converging.
     trust_region : bool, default True
         Restrict the capacities of each inner problem to a box around the
         previous iterate, of the relative width given by ``trust_region_*``.
         The radius is adapted from the exact KVL residual the new iterate
         leaves, which the linear model predicted to vanish, and from the
-        progress of the fixed-point residual; a step whose residual exceeds
-        ``trust_region_tolerances[1]`` is rejected and re-solved on a smaller
-        box.
+        progress of the fixed-point residual; after a step whose residual
+        exceeds ``trust_region_tolerances[1]`` the radius is shrunk, but the
+        step itself is kept and the next one is taken from it.
 
         This is the only control that bounds the step *hard*: it is the
         capacities themselves that are restricted, so the inner problem cannot
-        return a longer step whatever its objective would gain from one. A
-        rejected step is re-solved on a smaller box either way - rejection is
-        driven by the residual, not by this control, and a proximal term alone
-        rejects and re-solves just as well with a heavier weight.
+        return a longer step whatever its objective would gain from one. The
+        response to a large residual is driven by the residual, not by this
+        control: a proximal term alone narrows the next step just as well with
+        a heavier weight.
 
         Its weakness is that a box cannot distinguish a step that is too long
         from a step in a bad direction: where the optimal plan is many times the
@@ -197,16 +197,15 @@ def optimize_transmission_expansion_iteratively(
 
         Under ``scheme='fixed_point'`` the box is applied as well, from the
         second iteration onward, where it damps the fixed-point step; there is
-        no linearisation error to reject a step on there, so the radius is only
-        adapted from the progress of the residual.
+        no linearisation error to adapt on there, so the radius is only adapted
+        from the progress of the residual.
 
         On by default, but on the measured grid below it is *inert* next to the
         default ``proximal='l2'``: with the term active, on and off agree to
         2.4e-6 in cost on 17 of the 18 instances and agree exactly in
-        iterations, rejections and convergence. It is kept on because the bound
-        is the only hard one, because two active controls have to be exhausted
-        rather than one before a rejected step ends the run, and because it
-        costs nothing measurable; switching it off is a defensible choice.
+        iterations and convergence. It is kept on because the bound is the only
+        hard one and because it costs nothing measurable; switching it off is a
+        defensible choice.
     proximal : {'off', 'l1', 'l2'}, default 'l2'
         Add a proximal term to the objective which penalises moving the
         capacity of branch ``l`` away from the previous iterate ``F_l'``, in
@@ -311,9 +310,9 @@ def optimize_transmission_expansion_iteratively(
     proximal_bounds : tuple of float, optional
         Smallest and largest admissible weight of the proximal term. Defaults
         to ``PROXIMAL_BOUNDS`` of the chosen norm. The default L2 bounds are
-        ``(0.5, 0.5)``, so its weight is fixed. The iteration stops if an
-        adaptive weight has to be raised past its upper bound while the trust
-        region - if used - is exhausted as well.
+        ``(0.5, 0.5)``, so its weight is fixed. An adaptive weight saturates
+        at its upper bound; the iteration then continues at that weight until
+        it converges or ``max_iterations`` runs out.
     trust_region_initial : float, default 0.5
         Initial trust region radius. The capacity of branch ``l`` is restricted
         to
@@ -330,17 +329,18 @@ def optimize_transmission_expansion_iteratively(
         both ends; a symmetric region would tolerate a much larger error on the
         side where the capacity shrinks.
     trust_region_bounds : tuple of float, default (1e-2, 1.0)
-        Smallest and largest admissible trust region radius. The iteration
-        stops if the radius has to be shrunk below the lower bound while the
-        proximal weight - if used - is exhausted as well.
+        Smallest and largest admissible trust region radius. The radius
+        saturates at the lower bound; the iteration then continues at that
+        radius until it converges or ``max_iterations`` runs out.
     trust_region_tolerances : tuple of float, default (1e-4, 1e-2)
         Tolerances ``(target, maximum)`` on the linearisation error, measured
         as the residual of the exact voltage law of the new iterate relative to
         the voltage drop the branches of the cycle cause at their rated
         capacity. Below ``target`` the linear model described the step well and
-        the radius is expanded if it was binding, above ``maximum`` the step is
-        rejected and the radius is shrunk. The radius is also shrunk if a step
-        did not reduce the fixed-point residual.
+        the radius is expanded if it was binding, above ``maximum`` the radius
+        is shrunk. The step itself is kept either way - a solved iterate is
+        never discarded. The radius is also shrunk if a step did not reduce the
+        fixed-point residual.
     trust_region_factors : tuple of float, default (0.5, 2.0)
         Factors ``(shrink, expand)`` the trust region radius is multiplied
         with.
@@ -409,8 +409,8 @@ def optimize_transmission_expansion_iteratively(
     if scheme == "slp" and not (trust_region or proximal_on):
         logger.warning(
             "scheme='slp' without a step control: the linearisation is trusted "
-            "over an unbounded step, and since there is nothing to retry with, "
-            "every step is accepted however large its KVL residual. Expect the "
+            "over an unbounded step, and every step is taken however large its "
+            "KVL residual. Expect the "
             "iteration to oscillate rather than converge on a meshed network."
         )
     if proximal == "l1" and not trust_region:
@@ -1308,18 +1308,6 @@ def optimize_transmission_expansion_iteratively(
         if proximal_on:
             proximal_delta = float(max(proximal_delta / expand, delta_min))
 
-    def step_control_exhausted() -> bool:
-        """
-        No active control can restrict the step any further, so retrying would
-        re-solve the same problem. True as well when no control is switched on
-        at all, where there is nothing to retry with in the first place.
-        """
-        exhausted = []
-        if trust_region:
-            exhausted.append(radius <= radius_min)
-        if proximal_on:
-            exhausted.append(proximal_delta >= delta_max)
-        return all(exhausted) if exhausted else True
     reference_terms: pd.DataFrame | None = None
     previous_step: float | None = None
     plain_step = False
@@ -1332,7 +1320,7 @@ def optimize_transmission_expansion_iteratively(
     # present) SSSC compensation. Tracking adds only nominal-capacity columns
     # and objective scalars, not full primal/dual network results. The
     # converged iterate is completed and kept in place (see below), so only a
-    # rejected or superseded iterate's model needs releasing here.
+    # superseded iterate's model needs releasing here.
 
     def discard_model(network: Network) -> None:
         pending = getattr(network, "_pending_full_solve", None)
@@ -1496,24 +1484,22 @@ def optimize_transmission_expansion_iteratively(
             # ``cycle_terms`` and the scalar records above are detached from
             # Linopy, so the model itself is not needed for the decisions
             # below. Whether it is completed in place or discarded is decided
-            # once that decision (converged / rejected / superseded) is known.
+            # once that decision (converged / superseded) is known.
 
             # the linear model predicted a vanishing residual, so the residual
-            # left over is the error the trust region has to control. A step
-            # small enough to converge is always accepted: the linearisation
-            # then reproduces its own point, where the constraint coincides
-            # with the exact one.
+            # left over is the error the trust region has to control. It only
+            # steers the width of the next step: a solved iterate is never
+            # discarded, and at a converged point the linearisation reproduces
+            # its own point, where the constraint coincides with the exact one.
             converged = (
                 cost_converged(cost_history, cost) and iteration >= min_iterations
             )
-            accepted = True
             binding = boxed and trust_region_binding(caps, current_def, radius)
-            # a step is only worth reconsidering where a control could act on
-            # it, and only the linearised scheme leaves an error to reject on
+            # every solved iterate is kept; the controls only set how far the
+            # model is trusted over the *next* step
             controlled = (trust_region or proximal_on) and not converged
             if controlled and sensitivity is not None and violation_rel > error_max:
                 # the linear model did not describe the step
-                accepted = False
                 tighten()
             elif controlled and previous_step is not None and diff >= previous_step:
                 # the step did not reduce the fixed-point residual: the model is
@@ -1559,7 +1545,6 @@ def optimize_transmission_expansion_iteratively(
                     (f", radius = {radius:.3e}" if boxed else "")
                     + (f", proximal = {proximal_delta:.3e}" if proximal_on else "")
                     + (", binding" if binding else "")
-                    + (", step rejected" if not accepted else "")
                 ),
             )
             records.append(
@@ -1574,23 +1559,9 @@ def optimize_transmission_expansion_iteratively(
                     "radius": radius if boxed else np.nan,
                     "binding": binding,
                     "proximal": weight,
-                    "accepted": accepted,
+                    "accepted": True,
                 }
             )
-
-            if not accepted:
-                discard_model(n)
-                if step_control_exhausted():
-                    logger.warning(
-                        "The step control reached its bound (radius %.3e, "
-                        "proximal weight %.3e) without resolving the "
-                        "linearisation error. Stopping ...",
-                        radius,
-                        proximal_delta,
-                    )
-                    break
-                iteration += 1
-                continue
 
             if converged:
                 current_def = clip_branch_caps(
@@ -1677,10 +1648,9 @@ def optimize_transmission_expansion_iteratively(
         gc.collect()
 
     # Reached only if the loop stopped without convergence (max_iterations
-    # exhausted, or the trust region radius bottomed out on a rejected step):
-    # there is no solved iterate left to reuse, since the last attempted solve
-    # was itself discarded. Solve once more at the last accepted capacities to
-    # obtain a fully populated network.
+    # exhausted): there is no solved iterate left to reuse, since the last
+    # attempted solve was itself discarded. Solve once more at the last
+    # capacities of the iteration to obtain a fully populated network.
     logger.info(
         "Preparing final iteration with updated transmission parameters and extendable transmission capacities."
     )

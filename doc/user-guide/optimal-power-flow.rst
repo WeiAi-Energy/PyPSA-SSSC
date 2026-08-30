@@ -649,8 +649,9 @@ during the iteration:
 ``trust_region=True`` (default)
     Restricts the capacities of each inner problem to a box around the previous
     iterate, whose radius is adapted to the observed linearisation error. It is
-    the only control that bounds the step hard and the only one that can reject
-    a step and re-solve it, which makes it a safeguard rather than a preference.
+    the only control that bounds the step hard, which makes it a safeguard
+    rather than a preference. It narrows the next step rather than discarding
+    the one just solved: a solved iterate is always kept.
 
 ``proximal="l1"`` or ``proximal="l2"``
     Adds a penalty on moving a branch capacity away from the previous iterate,
