@@ -92,7 +92,7 @@ def optimize_transmission_expansion_iteratively(
     trust_region: bool = True,
     proximal: str = "l2",
     cost_threshold: float = 1e-5,
-    cost_window: int = 2,
+    cost_window: int = 1,
     proximal_metric: str = "capex",
     proximal_initial: float | None = None,
     proximal_bounds: tuple[float, float] | None = None,
