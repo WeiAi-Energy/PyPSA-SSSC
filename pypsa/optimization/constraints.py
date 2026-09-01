@@ -716,10 +716,29 @@ def define_relative_capacity_deviation(
 
     of the capacity from the linearisation point, which is defined here by one
     equation per branch. Its coefficient in the voltage law is the branch term
-    itself, which sits on the scale of the flow coefficients of the same row,
-    and the right hand side of the voltage law stays identically zero instead
-    of becoming the residual of the linearisation point, i.e. a sum of terms
-    that cancel down to round-off.
+    itself, and the right hand side of the voltage law stays identically zero
+    instead of becoming the residual of the linearisation point, i.e. a sum of
+    terms that cancel down to round-off.
+
+    What this does *not* buy is a row whose coefficients are all on one scale.
+    The branch term is ``x_l s_lt``, i.e. the flow coefficient ``x_l`` of the
+    same row times the flow itself, so the coefficient of ``u_l`` exceeds the
+    flow coefficients by the magnitude of the flow - two to four orders of
+    magnitude with the flow in MW - just as the coefficient of the capacity
+    would fall short of them by the same factor. The substitution moves the
+    spread to the other side of the flow coefficients rather than removing it;
+    what removes it is measuring the flows in units of the linearisation
+    capacity, which is not what ``s`` is. Measured on a 4000-bus US case with
+    8457 extendable branches, the coefficients of one voltage-law group run
+    ``2.1e-2 .. 3.0e+2`` without the linearisation and ``1.5e-4 .. 1.2e+4``
+    with it, i.e. the spread within the row widens from 1.4e4 to 7.8e7.
+
+    Note also that a presolve which aggregates ``u_l`` out through its own
+    defining equation lands back on the capacity formulation, RHS residual
+    included. Gurobi does this on every solve of the case above - the presolved
+    column count is identical with and without the linearisation - so under
+    that solver the reformulation is a no-op, and the choice between the two
+    forms is only felt on a solver that leaves the equation alone.
 
     Returns
     -------

@@ -49,22 +49,35 @@ logger = logging.getLogger(__name__)
 # past the point where it distorts the answer.
 #
 # ``l2`` has no dead zone - its gradient vanishes at the anchor, so a converged
-# point satisfies the unpenalised optimality conditions exactly.  Its default
-# is the calibrated unit weight; callers that want the former adaptive policy
-# can supply wider ``proximal_bounds`` explicitly.
+# point satisfies the unpenalised optimality conditions exactly, and the weight
+# is a pure speed-for-robustness trade rather than a bias on the answer. Its
+# default is fixed at ``0.5``; callers that want the former adaptive policy can
+# supply wider ``proximal_bounds`` explicitly.
+#
+# The weight buys iterations. Measured over the 18-instance meshed grid of
+# section 8.2 (SSSC on/off x brownfield capacity x capital cost, losses on) and
+# on SciGrid Germany, on every instance that converges a lighter weight reaches
+# the *same* plan in fewer steps: 0.5 -> 0.05 takes 111 -> 74 iterations over the
+# 16 meshed instances that converge either way, and 7 -> 4 on SciGrid. What it
+# costs is margin at the hard end, where the brownfield capacity is small against
+# the expansion the optimum wants: at 0.05 one of the 18 instances stops
+# converging and returns a plan 15 % above the best one, with an ``s_nom_opt``
+# against ``_s_nom_def`` gap of 11 % that ``violation_rel`` does not reveal.
+# ``0.5`` sits between the two measured points.
 PROXIMAL_BOUNDS: dict[str, tuple[float, float]] = {
     "l1": (1e-6, 1e-1),
     "l2": (0.5, 0.5),
 }
 
-# ``l2`` is deliberately kept at its calibrated unit weight by default.  A
-# caller can still request adaptive behaviour explicitly with wider
-# ``proximal_bounds``.  The ``l1`` term retains its historical adaptive range.
+# ``l2`` is deliberately kept at a fixed weight by default.  A caller can still
+# request adaptive behaviour explicitly with wider ``proximal_bounds``.  The
+# ``l1`` term retains its historical adaptive range.
 PROXIMAL_INITIAL: dict[str, float] = {"l1": 1e-3, "l2": 0.5}
 
-# At a proximal weight of 0.5, the L2 cross term cancels the ordinary linear
-# capacity cost exactly. Floating-point division by and multiplication with
-# the anchor can leave a coefficient around 1e-13. Such a residual has no
+# At a proximal weight of 0.5 the L2 cross term cancels the ordinary linear
+# capacity cost exactly, and away from it a near-cancellation can still leave a
+# tiny net coefficient. Floating-point division by and multiplication with the
+# anchor can leave a coefficient around 1e-13. Such a residual has no
 # useful effect on a QP solution but needlessly widens the objective range.
 PROXIMAL_L2_MIN_LINEAR_COEFFICIENT = 1e-6
 
@@ -89,7 +102,7 @@ def optimize_transmission_expansion_iteratively(
     max_iterations: int = 100,
     track_iterations: bool = False,
     scheme: str = "slp",
-    trust_region: bool = True,
+    trust_region: bool = False,
     proximal: str = "l2",
     cost_threshold: float = 1e-5,
     cost_window: int = 1,
@@ -171,7 +184,7 @@ def optimize_transmission_expansion_iteratively(
         the *next* step. With both off, ``'slp'`` is a bare Gauss-Newton
         iteration, and on a meshed network it oscillates instead of
         converging.
-    trust_region : bool, default True
+    trust_region : bool, default False
         Restrict the capacities of each inner problem to a box around the
         previous iterate, of the relative width given by ``trust_region_*``.
         The radius is adapted from the exact KVL residual the new iterate
@@ -200,12 +213,38 @@ def optimize_transmission_expansion_iteratively(
         no linearisation error to adapt on there, so the radius is only adapted
         from the progress of the residual.
 
-        On by default, but on the measured grid below it is *inert* next to the
-        default ``proximal='l2'``: with the term active, on and off agree to
-        2.4e-6 in cost on 17 of the 18 instances and agree exactly in
-        iterations and convergence. It is kept on because the bound is the only
-        hard one and because it costs nothing measurable; switching it off is a
-        defensible choice.
+        Off by default, because next to ``proximal='l2'`` it has never been
+        measured to earn its cost. It is inert on the grid below - with the term
+        active, on and off agree to 2.4e-6 in cost on 17 of the 18 instances and
+        agree exactly in iterations and convergence - and it is not free
+        elsewhere. Over 14 further instances, on the same meshed system with one
+        branch whose optimum is up to 300 times its brownfield capacity and on
+        SciGrid Germany (585 buses, 852 lines, brownfield derated to 1.0 / 0.5 /
+        0.3, with and without SSSC), switching it off never lost::
+
+                                small system      SciGrid Germany
+            box on                60 iterations     72 iterations
+            box off               51 iterations     68 iterations
+            worse on any instance none              none
+            cost difference       <= 2e-5 %         <= 7e-4 %
+
+        On SciGrid the largest relative capacity step along the path is the same
+        with and without the box, i.e. the box never bound there; on the small
+        system it bound on 9 of 12 steps, which is where its cost comes from -
+        the box cannot tell a long step from a bad one, so it throttles a branch
+        that has to grow by orders of magnitude just as it throttles a branch
+        oscillating between equal-cost plans.
+
+        What is unique to it remains: it is the only *hard* bound, so it is the
+        safeguard to reach for when a run diverges or oscillates, and it is what
+        makes ``proximal='l1'`` usable at all (6/18 converged alone, 16/18
+        behind the box). No instance measured so far has needed it, but none has
+        exercised the divergence it exists to prevent either.
+
+        The step controls are also skipped in the first iteration, where no
+        previous iterate exists to centre a box on. Applying one there, on the
+        brownfield capacities, makes the first inner problem infeasible wherever
+        the optimal plan is several times the existing grid.
     proximal : {'off', 'l1', 'l2'}, default 'l2'
         Add a proximal term to the objective which penalises moving the
         capacity of branch ``l`` away from the previous iterate ``F_l'``, in
@@ -256,7 +295,8 @@ def optimize_transmission_expansion_iteratively(
         J(F*) + P(F*)``, so ``J(F@) - J(F*) <= P(F*)``. That bound is what
         ``PROXIMAL_BOUNDS`` keeps small.
 
-        ``'l2'`` by default, which is the switch the defaults turn on. Measured
+        ``'l2'`` by default, and the only step control the defaults turn on.
+        Measured
         over the full grid of the three switches on the meshed test system of
         ``test/test_lopf_iteratively.py`` - 18 instances, SSSC on/off times
         three brownfield capacities times three capital costs, 40 iterations -
@@ -290,7 +330,7 @@ def optimize_transmission_expansion_iteratively(
         ``cost_window`` accepted iterations. The cost is invariant under the
         exchange of degenerate alternative optima, which the change of the
         capacities is not, and it is the quantity the results are reported in.
-    cost_window : int, default 2
+    cost_window : int, default 1
         Number of consecutive relative cost changes that have to undercut
         ``cost_threshold``.
     proximal_metric : {'capex', 'uniform'}, default 'capex'
@@ -313,9 +353,9 @@ def optimize_transmission_expansion_iteratively(
         ``(0.5, 0.5)``, so its weight is fixed. An adaptive weight saturates
         at its upper bound; the iteration then continues at that weight until
         it converges or ``max_iterations`` runs out.
-    trust_region_initial : float, default 0.5
-        Initial trust region radius. The capacity of branch ``l`` is restricted
-        to
+    trust_region_initial : float, default 1.0
+        Initial trust region radius, used only where ``trust_region=True``. The
+        capacity of branch ``l`` is restricted to
 
         ``F_def_l - radius / (1 + radius) * S_l <= F_l <= F_def_l + radius * S_l``
 
@@ -329,10 +369,11 @@ def optimize_transmission_expansion_iteratively(
         both ends; a symmetric region would tolerate a much larger error on the
         side where the capacity shrinks.
     trust_region_bounds : tuple of float, default (1e-2, 1.0)
-        Smallest and largest admissible trust region radius. The radius
+        Smallest and largest admissible trust region radius, used only where
+        ``trust_region=True``. The radius
         saturates at the lower bound; the iteration then continues at that
         radius until it converges or ``max_iterations`` runs out.
-    trust_region_tolerances : tuple of float, default (1e-4, 1e-2)
+    trust_region_tolerances : tuple of float, default (1e-5, 1e-2)
         Tolerances ``(target, maximum)`` on the linearisation error, measured
         as the residual of the exact voltage law of the new iterate relative to
         the voltage drop the branches of the cycle cause at their rated
@@ -343,7 +384,9 @@ def optimize_transmission_expansion_iteratively(
         fixed-point residual.
     trust_region_factors : tuple of float, default (0.5, 2.0)
         Factors ``(shrink, expand)`` the trust region radius is multiplied
-        with.
+        with. They apply to the weight of the proximal term as well, which is
+        adapted by the same schedule, so they are in use whichever control is
+        switched on.
     sensitivity_tolerance : float, default 1e-6
         Relative size below which the linearisation of ``scheme='slp'`` drops
         a branch sensitivity, measured against the voltage drop that
@@ -909,7 +952,8 @@ def optimize_transmission_expansion_iteratively(
         """Remove numerically irrelevant net linear terms left in an L2 QP.
 
         With the normal scale ``F'``, a proximal weight of 0.5 makes the L2
-        cross term exactly cancel the ordinary capacity cost. Linopy aggregates
+        cross term exactly cancel the ordinary capacity cost, and a weight near
+        it can leave a tiny net coefficient. Linopy aggregates
         the two summands only while exporting, where roundoff can leave a
         coefficient around 1e-13. Aggregate by variable here and zero a tiny
         *net* coefficient before export. The diagonal L2 terms remain intact

@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import pandas as pd
 from numpy.testing import assert_array_almost_equal as almost_equal
@@ -117,3 +119,27 @@ def test_multiport_assingment_defaults_madd():
     n.madd("Link", ["link"], bus0="bus", bus1="bus2")
     n.madd("Link", ["link2"], bus0="bus", bus1="bus2", bus2="bus")
     assert n.links.loc["link", "bus2"] == ""
+
+
+def test_selected_variable_import_warns_on_a_non_optimal_termination(caplog):
+    """A sub-optimal solve must not be reported as a successful one.
+
+    Gurobi returns status 13 when it cannot meet its own tolerances, which
+    linopy maps to the ``ok`` solver status ``suboptimal``. The solve is kept
+    and the caller carries on, so the only place the loss of the optimality
+    certificate can still be seen is the log.
+    """
+    from pypsa.optimization.optimize import _report_selected_variable_import
+
+    with caplog.at_level(logging.INFO, logger="pypsa.optimization.optimize"):
+        _report_selected_variable_import("optimal", 7)
+    assert [record.levelname for record in caplog.records] == ["INFO"]
+    assert "Optimization successful" in caplog.records[0].message
+
+    for condition in ("suboptimal", "iteration_limit", "time_limit"):
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="pypsa.optimization.optimize"):
+            _report_selected_variable_import(condition, 7)
+        assert [record.levelname for record in caplog.records] == ["WARNING"]
+        assert "did not reach an optimal solution" in caplog.records[0].message
+        assert condition in caplog.records[0].getMessage()

@@ -311,7 +311,8 @@ unbounded step and is helped by the same controls — and both are adapted durin
 the iteration rather than set by the user.
 
 They bound the step in different ways, and the difference is what makes them
-complementary:
+complementary — although only the proximal term is on by default, see section
+8.3:
 
 * the **trust region** is a hard bound: the capacities themselves are
   restricted, so the inner problem cannot return a longer step whatever its
@@ -329,7 +330,7 @@ narrows the step the *next* iteration is allowed to take - on a smaller box, or
 under a heavier penalty - but the iterate that produced it is still taken as the
 next linearisation point.
 
-### 6.1 Trust region (`trust_region=True`)
+### 6.1 Trust region (`trust_region=True`, off by default)
 
 The radius is relative to the capacity of the linearisation point and floored by
 the initial capacity, so it cannot collapse for a branch shrinking towards zero:
@@ -387,7 +388,7 @@ The cost weighting matters: in the maximum norm a single small branch swinging
 between degenerate optima already fills its own width and would report a
 restriction that does not exist.
 
-### 6.2 Proximal term (`proximal="l1"` or `proximal="l2"`)
+### 6.2 Proximal term (`proximal="l2"` by default, or `"l1"`)
 
 The inner objective carries an extra penalty on moving a branch capacity away
 from the linearisation point,
@@ -668,16 +669,72 @@ with $\ell_2$ active, on and off agree to $2.4\cdot10^{-6}$ in cost on 17 of the
 18 instances, and agree exactly in iterations and convergence. Its
 measurable value is elsewhere — it is what rescues $\ell_1$ (6/18 converged and
 5.65 % mean become 16/18 and 0.55 %), which is the degeneracy argument of
-section 6 in numbers. What is unique to the box is that the bound is hard. It is
-left on by default because it costs nothing measurable here and because it is
-the only hard bound; on this evidence `trust_region=False` is an entirely
-defensible choice.
+section 6 in numbers. What is unique to the box is that the bound is hard.
+Section 8.3 extends this to instances on which it is not inert; it is off by
+default.
 
 > The grid above was measured while a step whose residual exceeded
 > $\varepsilon_{\max}$ was *discarded* and re-solved at the same linearisation
 > point. That rejection has since been removed — every solved iterate is now
 > kept, and a large residual only tightens the next step — so the counts and
 > gaps in the table predate the current step control and are indicative only.
+
+### 8.3 Why the trust region is off by default
+
+Section 8.2 found the box inert next to $\ell_2$ on a grid whose brownfield
+capacities are uniform across the branches. Two further grids, measured with the
+current step control (no rejection of solved steps, geometric region,
+$\varepsilon = (10^{-5}, 10^{-2})$, $\rho^1 = 1$), ask whether it is inert or
+merely harmless, and whether that survives on a large network.
+
+**A branch that has to grow by orders of magnitude.** The meshed system of
+section 8.2 with the chord `ac` starting at 1-20 MW against 50 MW on the other
+four lines and at a capital cost of 20 or 100 against 200, so that the optimum
+wants it at 216-303 MW - a relative expansion of up to $303\times$, one to two
+orders of magnitude beyond every other branch. Six instances, $\ell_2$ active:
+
+| | box on | box off |
+| --- | ---: | ---: |
+| iterations, 6 instances | 60 | **51** |
+| instances on which it is worse | - | none |
+| excess cost over the best plan | $\le 2\cdot10^{-5}$ % | 0 % |
+
+The whole difference sits on the $303\times$ instance (12 iterations against 7).
+There the box binds on 9 of 12 steps and the capacity of `ac` climbs
+$80.8 \to 161.6 \to 242.4 \to 290$, in steps of exactly the width the box
+allows: $\Delta^{n,+}_\ell = \rho^n\max(F^{n,\mathrm{fix}}_\ell, F^0_\ell)$ caps
+a branch at doubling per iteration, and $\rho$ has halved once on the first large
+residual. Without the box the same branch reaches 263.7 in its second step and
+the iteration is done in 7. This is the structural weakness of section 6 in
+numbers: the box bounds the *length* of the step per branch and cannot tell a
+branch that must grow by two orders of magnitude from one oscillating between
+equal-cost plans.
+
+**A large network.** SciGRID Germany, brownfield derated to $1.0/0.5/0.3$ so
+that between 45 and 222 lines expand and the largest relative expansion is
+$4.7\times$ to $16.9\times$; two capital costs, four snapshots, with and without
+SSSC on the 40 widest lines. Eight instances, $\ell_2$ active, 8/8 converged
+either way:
+
+| | box on | box off |
+| --- | ---: | ---: |
+| iterations, 8 instances | 72 | **68** |
+| instances on which it is worse | - | none |
+| excess cost | 0 % | $\le 7\cdot10^{-4}$ % |
+| worst KVL residual along the path | 0.0444 | 0.0444 |
+| largest relative capacity step | 0.5468 | 0.5468 |
+
+The last row is the informative one: the largest step taken is *identical* with
+and without the box, so on this network the box never bound at all and the four
+iterations it costs are spent on its own adaptation. The cost differences of
+$10^{-4}$ % are below the solver tolerance and fall on both sides.
+
+**What is not shown.** No instance of either grid diverged, so none exercised
+what the box exists for. It remains the only hard bound on the step - the
+$\ell_2$ term prices a step but does not forbid one - and it remains what makes
+$\ell_1$ usable (6/18 against 16/18 in section 8.2). `trust_region=True` is
+therefore the first thing to try on a run that oscillates, that fails to
+converge, or that uses $\ell_1$; it is simply not worth its cost by default.
 
 ---
 
@@ -739,17 +796,17 @@ the solution the iteration converged to, with capacities and flows consistent.
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `scheme` | `"slp"` | inner model, see sections 4 and 5 |
-| `trust_region` | `True` | hard bound on the step, section 6.1 |
+| `trust_region` | `False` | hard bound on the step, sections 6.1 and 8.3 |
 | `proximal` | `"l2"` | `"off"`, `"l1"` or `"l2"`, section 6.2 |
 | `cost_threshold` $\varepsilon$ | `1e-5` | convergence tolerance on the system cost |
-| `cost_window` | `2` | consecutive cost changes that must undercut it |
-| `trust_region_initial` $\rho^1$ | `0.5` | initial radius, relative to $\max(F^{n,\mathrm{fix}}, F^0)$ |
-| `trust_region_bounds` | `(1e-3, 4.0)` | $(\rho_{\min}, \rho_{\max})$ |
-| `trust_region_tolerances` | `(1e-4, 1e-2)` | $(\varepsilon_{\mathrm{tgt}}, \varepsilon_{\max})$ |
-| `trust_region_factors` | `(0.5, 2.0)` | $(\sigma, \gamma)$ |
+| `cost_window` | `1` | consecutive cost changes that must undercut it |
+| `trust_region_initial` $\rho^1$ | `1.0` | initial radius, relative to $\max(F^{n,\mathrm{fix}}, F^0)$ |
+| `trust_region_bounds` | `(1e-2, 1.0)` | $(\rho_{\min}, \rho_{\max})$ |
+| `trust_region_tolerances` | `(1e-5, 1e-2)` | $(\varepsilon_{\mathrm{tgt}}, \varepsilon_{\max})$ |
+| `trust_region_factors` | `(0.5, 2.0)` | $(\sigma, \gamma)$, applied to $\rho$ and to $\delta$ alike |
 | `proximal_metric` | `"capex"` | weight $c_\ell$ of the penalty: `"capex"` or `"uniform"` |
-| `proximal_initial` $\delta^1$ | `l1: 1e-3`, `l2: 0.5` | initial weight; the default L2 setting is fixed at 0.5 |
-| `proximal_bounds` | `l1: (1e-6, 1e-1)`, `l2: (0.5, 0.5)` | $(\delta_{\min}, \delta_{\max})$, per norm; pass wider L2 bounds to opt into adaptation |
+| `proximal_initial` $\delta^1$ | `l1: 1e-3`, `l2: 0.1` | initial weight; the default L2 setting is fixed at 0.1 |
+| `proximal_bounds` | `l1: (1e-6, 1e-1)`, `l2: (0.1, 0.1)` | $(\delta_{\min}, \delta_{\max})$, per norm; pass wider L2 bounds to opt into adaptation |
 | `sensitivity_tolerance` $\tau$ | `1e-6` | loading below which a branch sensitivity is dropped, see 5.2.2; `0` keeps all |
 | `min_iterations`, `max_iterations` | `1`, `100` | iteration bounds |
 | `track_iterations` | `False` | keep the nominal capacities and objective of every iterate |

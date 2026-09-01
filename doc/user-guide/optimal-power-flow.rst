@@ -646,26 +646,36 @@ A linearisation is only valid over a limited step, and two step controls bound
 it. They are independent of each other and of the scheme, and both are adapted
 during the iteration:
 
-``trust_region=True`` (default)
-    Restricts the capacities of each inner problem to a box around the previous
-    iterate, whose radius is adapted to the observed linearisation error. It is
-    the only control that bounds the step hard, which makes it a safeguard
-    rather than a preference. It narrows the next step rather than discarding
-    the one just solved: a solved iterate is always kept.
-
-``proximal="l1"`` or ``proximal="l2"``
+``proximal="l2"`` (default)
     Adds a penalty on moving a branch capacity away from the previous iterate,
     in units of that branch's capital cost. The default ``"l2"`` weight is
-    fixed at 0.5; it can be made adaptive by passing wider ``proximal_bounds``.
+    fixed at 0.1; it can be made adaptive by passing wider ``proximal_bounds``.
+    A lighter weight reaches the same plan in fewer iterations wherever the run
+    converges, and costs margin on instances whose brownfield capacity is small
+    against the expansion the optimum wants; raise it towards 0.5 on a run that
+    does not converge.
     It also resolves the degeneracy that lets equal-cost plans
     exchange capacity between branches. ``"l2"`` keeps the objective's optimality
     conditions exact at the anchor at the price of a quadratic inner problem;
     ``"l1"`` keeps the inner problem linear but has a dead zone, so its weight is
     capped an order of magnitude lower and it cannot serve as the only control.
 
+``trust_region=True`` (off by default)
+    Restricts the capacities of each inner problem to a box around the previous
+    iterate, whose radius is adapted to the observed linearisation error. It
+    narrows the next step rather than discarding the one just solved: a solved
+    iterate is always kept. It is the only control that bounds the step *hard*,
+    which is why it is the safeguard to reach for when a run oscillates or
+    diverges, and it is what makes ``proximal="l1"`` usable at all. It is off by
+    default because next to ``"l2"`` it has not been measured to earn its cost:
+    on the meshed test system and on SciGrid Germany it never improved the plan
+    and cost 6-15 % more iterations, and where it does bind it throttles a
+    branch that has to grow by orders of magnitude just as it throttles one
+    oscillating between equal-cost plans.
+
 Both schemes stop once the **system cost** has changed by less than
 ``cost_threshold`` (default ``1e-5``) in each of the last ``cost_window``
-(default ``2``) iterations. The relative change of the transmission capacities,
+(default ``1``) iterations. The relative change of the transmission capacities,
 which earlier versions used as criterion, is only reported as a diagnostic: it
 is a step size rather than a measure of convergence, and on meshed networks
 degenerate alternative optima keep it bouncing long after the solution has
@@ -674,8 +684,8 @@ settled, while a small step can occur by accident.
 The convergence history is written to ``n.iteration_log``, which reports per
 iteration the system cost and its relative change, the relative change of the
 transmission capacities, the residual of the exact voltage law, the trust region
-radius and whether it was binding, the weight of the proximal term, and whether
-the step was accepted.
+radius and whether it was binding (both empty unless ``trust_region=True``), the
+weight of the proximal term, and whether the step was accepted.
 
 
 Security-Constrained Power Flow

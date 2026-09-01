@@ -15,6 +15,7 @@ for module_name in list(sys.modules):
 pypsa = importlib.import_module("pypsa")
 optimize_module = importlib.import_module("pypsa.optimization.optimize")
 constraints_module = importlib.import_module("pypsa.optimization.constraints")
+abstract_module = importlib.import_module("pypsa.optimization.abstract")
 
 SOLVER = dict(
     solver_name="gurobi",
@@ -77,7 +78,7 @@ def test_iterative_updates_next_def_from_outer_optimum(monkeypatch):
 
 
 def test_proximal_initial_weight_is_not_relaxed_before_first_linearisation(monkeypatch):
-    """The default L2 proximal weight stays at 0.5 after the first solve."""
+    """The default L2 proximal weight stays at its default after the first solve."""
     n = _build_simple_network()
 
     def fake_optimize(network, snapshots=None, *args, **kwargs):
@@ -86,6 +87,13 @@ def test_proximal_initial_weight_is_not_relaxed_before_first_linearisation(monke
         return "ok", "optimal"
 
     monkeypatch.setattr(optimize_module, "optimize", fake_optimize)
+    # The fake solve returns the same capacities every time, so the system cost
+    # does not move and the run converges on the third iteration. Converging
+    # materialises the user-facing solution, which a solve that never built a
+    # model cannot provide - and this test is about the weights in the log, not
+    # about the solution. Stub the three materialisation steps out.
+    for name in ("assign_solution", "assign_duals", "post_processing"):
+        monkeypatch.setattr(optimize_module, name, lambda *a, **kw: None)
 
     n.optimize.optimize_transmission_expansion_iteratively(
         max_iterations=3,
@@ -95,7 +103,8 @@ def test_proximal_initial_weight_is_not_relaxed_before_first_linearisation(monke
 
     # Iteration 1 has no anchor. Every anchored solve uses the fixed default
     # L2 weight, despite the normal relax/tighten control flow.
-    assert n.iteration_log.proximal.tolist() == [0.0, 0.5, 0.5]
+    default = abstract_module.PROXIMAL_INITIAL["l2"]
+    assert n.iteration_log.proximal.tolist() == [0.0, default, default]
 
 
 def test_iterative_invalid_switches_raise():

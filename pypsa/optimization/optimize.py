@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from linopy import Model, merge
-from linopy.constants import Status
+from linopy.constants import Status, TerminationCondition
 from linopy.solvers import available_solvers
 from scipy.sparse.linalg import spsolve
 
@@ -638,6 +638,36 @@ def _int_index_from_names(named_values: dict[str, float]) -> pd.Series:
     return series
 
 
+def _report_selected_variable_import(
+    termination_condition: str, imported: int
+) -> None:
+    """Report the outcome of a selected-variable solve at the right level.
+
+    Every termination condition other than ``optimal`` is reported as a
+    warning. ``suboptimal`` in particular is an ``ok`` status, so the solve is
+    kept and the caller carries on - but the solver has said it could not meet
+    its own tolerances, and on a barrier run without crossover that is the
+    difference between a certified optimum and wherever the central path was
+    abandoned. Reporting it as a success left the solver log as the only trace
+    of it.
+    """
+    if termination_condition != TerminationCondition.optimal.value:
+        logger.warning(
+            "Solver did not reach an optimal solution (termination condition "
+            "'%s'): imported %d selected primal variable group(s) without "
+            "duals. The solution is used as it stands; check the solver log "
+            "and the solution quality before relying on it.",
+            termination_condition,
+            imported,
+        )
+    else:
+        logger.info(
+            "Optimization successful: imported %d selected primal variable "
+            "group(s) without duals.",
+            imported,
+        )
+
+
 def _solve_model_with_selected_variables(
     n: Network,
     m: Model,
@@ -836,9 +866,8 @@ def _solve_model_with_selected_variables(
 
     n._pending_full_solve = SimpleNamespace(finish=finish, discard=discard)
 
-    logger.info(
-        "Optimization successful: imported %d selected primal variable group(s) "
-        "without duals.",
+    _report_selected_variable_import(
+        m.termination_condition,
         sum(name in m.variables for name in selected_variables),
     )
     return m.status, m.termination_condition
