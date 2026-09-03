@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 # the plan. The term cannot be relied on as the only step control: the weight it
 # would need to control a large step is past the point where it distorts the
 # answer.
-PROXIMAL_WEIGHT = 1e-2
+PROXIMAL_WEIGHT = 1e-3
 
 @dataclass
 class TransmissionIterationResult:
