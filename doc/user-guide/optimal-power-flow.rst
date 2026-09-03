@@ -643,13 +643,14 @@ Two schemes are available through the ``scheme`` argument:
     of Hagspiel et al. (2014).
 
 A linearisation is only valid over a limited step, and two step controls bound
-it. They are independent of each other and of the scheme, and both are adapted
-during the iteration:
+it. They are independent of each other and of the scheme; the trust region
+radius is adapted during the iteration, the proximal weight is not:
 
 ``proximal="l2"`` (default)
     Adds a penalty on moving a branch capacity away from the previous iterate,
-    in units of that branch's capital cost. The default ``"l2"`` weight is
-    fixed at 0.1; it can be made adaptive by passing wider ``proximal_bounds``.
+    in units of that branch's capital cost. Its weight ``proximal_weight``
+    defaults to 0.5 for ``"l2"`` and 1e-3 for ``"l1"`` and is fixed for the
+    whole run.
     A lighter weight reaches the same plan in fewer iterations wherever the run
     converges, and costs margin on instances whose brownfield capacity is small
     against the expansion the optimum wants; raise it towards 0.5 on a run that

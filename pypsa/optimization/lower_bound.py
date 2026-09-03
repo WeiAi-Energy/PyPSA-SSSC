@@ -1034,7 +1034,7 @@ def certify_expansion(
     Examples
     --------
     >>> n.optimize.optimize_transmission_expansion_iteratively(  # doctest: +SKIP
-    ...     trust_region=True, solver_name="gurobi"
+    ...     solver_name="gurobi"
     ... )
     >>> print(certify_expansion(n0, branch_series(n, "s_nom_opt")))  # doctest: +SKIP
     """

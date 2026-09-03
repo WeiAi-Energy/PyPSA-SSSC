@@ -63,7 +63,7 @@ iteration exists for the voltage law alone.
 | $c_\ell$ | `capital_cost` | annualised capacity cost of branch $\ell$ (1a) |
 | $F^{\min}_\ell, F^{\max}_\ell$ | `s_nom_min`, `s_nom_max` | capacity bounds as given by the user (1f) |
 | $\varepsilon$ | `cost_threshold` | convergence tolerance, here on the system cost rather than on the capacities as in Algorithm 1 |
-| $\varepsilon_{\mathrm{tgt}}, \varepsilon_{\max}$ | `trust_region_tolerances` | linearisation error that is good enough / too large |
+| $a_{\mathrm{tighten}}, a_{\mathrm{relax}}$ | `trust_region_alignment` | step angle that is a reversal / a continuation |
 | $\rho_{\min}, \rho_{\max}$ | `trust_region_bounds` | admissible trust region radii |
 | $\sigma, \gamma$ | `trust_region_factors` | shrink and expand factor of the radius |
 | $\tau$ | `sensitivity_tolerance` | loading below which a branch sensitivity is dropped |
@@ -284,17 +284,26 @@ Intermediate iterations read back only the variable groups the outer loop needs
 `LineX-q_sssc`, plus the nominal-capacity columns and objective scalars if
 `track_iterations=True` — and neither duals nor derived time series.
 
-* **On convergence** the converged iterate's own LP *is* the result. Its
-  already-solved model is completed in place — on the Gurobi fast path from the
-  same solved model, without a second call to the solver — and the full primal
-  solution, the duals and the derived network time series are assigned from it.
-  There is no re-solve at the converged point, unlike line 7 of Algorithm 1.
-* **Without convergence** (`max_iterations` exhausted) the last attempted solve
-  was discarded, so one further
-  solve is run at the last capacities $F^{\mathrm{fix}}$, in the plain
-  formulation (10d) — no sensitivities, no box — to obtain a fully populated
-  network. If that solve fails, the status of the last successful loop solve is
-  reported.
+Every run, converged or not, is closed by the same **report solve**: the
+impedances are set from the last capacities $F^{\mathrm{fix}}$, those
+capacities — AC branches and DC links alike — are pinned by
+$F^{\min} = F^{\max} = F^{\mathrm{fix}}$, and the plain formulation (10d) is
+solved once, with neither sensitivities nor box nor penalty. The full primal
+solution, the duals and the derived network time series come from it. Everything
+that is not transmission capacity — the series compensation, the generation and
+storage capacities, the dispatch — is re-optimised there, which is what makes
+the result the cost *of* that plan.
+
+* **On convergence** the linearisation is exact at $F^{\mathrm{fix}}$, so the
+  report solve reproduces the converged iterate: measured on the meshed test
+  network, `n.objective` matches the last `iteration_log` cost to
+  $2.4\cdot10^{-12}$ relative and `s_nom_opt` matches $F^{\mathrm{fix}}$ to
+  $2.2\cdot10^{-12}$. This is line 7 of Algorithm 1.
+* **Without convergence** (`max_iterations` exhausted) the same solve prices the
+  last accepted plan, which is not the same as the plan the iteration would have
+  reached. If it fails, the status of the last successful loop solve is
+  reported, but no solution is left on the network, since every iterate's model
+  has been released.
 
 In both cases the trust region bounds and the sensitivity attached to the
 network are removed afterwards, also when the loop is left through an exception.
@@ -388,7 +397,19 @@ The cost weighting matters: in the maximum norm a single small branch swinging
 between degenerate optima already fills its own width and would report a
 restriction that does not exist.
 
-### 6.2 Proximal term (`proximal="l2"` by default, or `"l1"`)
+### 6.2 Proximal term (`proximal_weight`, `proximal_target`)
+
+> **The $\ell_2$ norm and `damping` are no longer selectable.** They stay
+> in this document because the measurements that name them stand — on the
+> small meshed system $\ell_2$ is the best-behaved control of the three.
+> They were removed from the API for reasons measured elsewhere. The
+> $\ell_2$ term makes the inner problem a quadratic program, and on a
+> 1.7 M column model the barrier then stops converging on the *dual*: its
+> dual infeasibility settles at 1e-4 where the linear program reaches
+> 1e-8, while the factorisation costs the same to within 5 %. The
+> conditioning of the Hessian has nothing to do with it — a term whose
+> Hessian is a multiple of the identity stalls exactly as one spanning
+> four decades does. For `damping`, see section 8.4.
 
 The inner objective carries an extra penalty on moving a branch capacity away
 from the linearisation point,
@@ -402,9 +423,9 @@ which is the $u_\ell$ of section 5.2 wherever the floor below is inactive, with
 $S^n_\ell = \max(F^{n,\mathrm{fix}}_\ell, \underline{S}^n)$ the
 anchor floored by $\underline{S}^n = \max(10^{-3}\max_\ell F^{n,\mathrm{fix}}_\ell, 10^{-6})$
 so a branch collapsing towards zero cannot make the weight diverge. The weight
-$c_\ell$ is the annualised capital cost of the branch (`proximal_metric="capex"`,
-the default) or the mean capital cost for every branch
-(`proximal_metric="uniform"`, which charges capacity rather than cost).
+$c_\ell$ is the annualised capital cost of the branch, so every branch faces the
+same hurdle relative to its own cost; a branch whose capital cost is missing or
+non-positive is charged the mean of the rest.
 
 **The two norms are calibrated on the same scale.** Both charge $\delta^n c_\ell$
 for moving branch $\ell$ by its own size, so $\delta$ is dimensionless in both
@@ -465,34 +486,107 @@ $\delta$ divided where $\rho$ is multiplied.
 
 ### 6.3 Acceptance and adaptation
 
-Both controls are adapted by the same decision, and by the same factors.
-Write $\mathrm{tighten}$ for $\rho \leftarrow \max(\sigma\rho, \rho_{\min})$
-together with $\delta \leftarrow \min(\delta/\sigma, \delta_{\max})$, and
-$\mathrm{relax}$ for $\rho \leftarrow \min(\gamma\rho, \rho_{\max})$ together
-with $\delta \leftarrow \max(\delta/\gamma, \delta_{\min})$; whichever control is
-switched off is simply left out. Evaluated in this order, and only while at
-least one control is active and the iteration has not converged:
+Only the trust region radius is adapted. The proximal weight $\delta$ is fixed
+for the whole run: it is a property of the problem — the share of a branch's
+capital cost charged for moving it by its own size — not a state of the
+iteration, and the schedule that used to adapt it needed a residual outside
+$(\varepsilon_{\mathrm{tgt}}, \varepsilon_{\max})$, while a run spends its
+iterations between them, so it never fired.
+
+The radius follows the **direction** of the step, not the linearisation error it
+leaves. Write $r^n = F^n - F^{n,\mathrm{fix}}$ for the fixed-point residual of
+step $n$ — the move the linear model asked for from the point it was linearised
+at — and
+
+$$
+a^n \;=\; \frac{\langle c \odot r^n,\; c \odot r^{n-1}\rangle}
+{\lVert c \odot r^n\rVert \, \lVert c \odot r^{n-1}\rVert}
+$$
+
+for the cosine between two consecutive residuals, weighted with the capital cost
+$c_\ell$ of the capacity they move — the same weighting the binding test uses,
+and for the same reason: a swarm of tiny cheap branches swinging between
+degenerate optima would otherwise decide the angle. Write $\mathrm{tighten}$ for
+$\rho \leftarrow \max(\sigma\rho, \rho_{\min})$ and $\mathrm{relax}$ for
+$\rho \leftarrow \min(\gamma\rho, \rho_{\max})$. Evaluated in this order, and
+only while the box is active, the iteration has not converged, and a previous
+direction exists to compare with:
 
 | condition | action |
 | --- | --- |
-| $\hat{V}^n > \varepsilon_{\max}$ | accept, $\mathrm{tighten}$ — the linear model did not describe the step |
-| else if $\mathrm{step}^n \ge \mathrm{step}^{n-1}$ | accept, $\mathrm{tighten}$ — no progress, the model is trusted over too wide a range |
-| else if $\hat{V}^n \le \varepsilon_{\mathrm{tgt}}$ and (binding or a proximal term is active) | accept, $\mathrm{relax}$ |
-| otherwise | accept, both controls unchanged |
+| $a^n \le a_{\mathrm{tighten}}$ | accept, $\mathrm{tighten}$ — the step undid the one before it |
+| else if $a^n \ge a_{\mathrm{relax}}$ and binding | accept, $\mathrm{relax}$ — the iteration walks one way and the box holds it back |
+| otherwise | accept, the radius unchanged |
 
-Every row accepts: a solved iterate is never discarded, and the controls only
-set the width of the next step.
+Every row accepts: a solved iterate is never discarded, and the radius only
+sets the width of the next step.
 
-The linearisation error $\hat{V}^n$ is only available where a linearisation is
-active; where it is not — the first iteration, and every iteration of the fixed
-point — the first and third rows read as if the error were acceptable, so the
-controls relax rather than stay put.
+**Why the angle and not the residual.** An expanding branch lowers its own
+impedance and attracts flow, which the next model answers by shrinking it again.
+Where that feedback reflects rather than contracts, the iteration settles into an
+orbit of period two, and neither of the quantities the radius used to be steered
+by sees it: the residual $\hat{V}^n$ is *small* on an orbit, and the step size is
+flat rather than growing, so a criterion on either fires only by accident. The
+radius is nonetheless the control that resolves it: the region is geometrically
+symmetric, so a branch that jumps to one wall finds the other wall exactly back
+at its previous capacity — the orbit lives on the walls, reproduces itself for as
+long as the radius is held, and shrinks in proportion to it.
+
+**Damping.** `damping` $= \theta$ carries only part of the step into the next
+linearisation point, $F^{n+1,\mathrm{fix}} = F^{n,\mathrm{fix}} + \theta r^n$,
+which turns a reflecting map into a contracting one and so damps that orbit
+directly rather than only bounding it. It does not move the fixed point: where
+$r = 0$ the damped update reproduces the undamped one.
+
+`damping='auto'` reads $\theta$ off the last two steps. Damping gives the
+iteration the multiplier $1 + \theta(\lambda - 1)$, where $\lambda$ is the
+multiplier of the *undamped* map, so the fraction that cancels the reflection is
+$\theta = 1/(1-\lambda)$. What the iteration observes is not $\lambda$ but the
+gain $g$ of a step it already damped with $a$, i.e. $g = 1 + a(\lambda-1)$, so
+the estimate is taken back through that: $\hat\lambda = 1 + (g-1)/a$. Reading
+$\theta = 1/(1-g)$ off the damped gain instead under-damps, and does so stably
+rather than transiently — that rule has a fixed point at
+$g = 1 - \sqrt{1-\lambda}$, where the iteration settles at a reflection it never
+removes. Measured on the 3 GVA SSSC case it parked at $g = -0.55$,
+$\theta = 0.65$ for five iterations with the step and the residual flat, against
+a recovered $\lambda = -1.45$ whose correct damping is $0.41$. A map that
+contracts on its own is left alone, floored at `DAMPING_MIN`. Either way the first step is undamped: it has no predecessor to
+average with, and it is the one step that has to cover the distance from the
+initial capacities to the scale the expansion needs.
+
+The threshold has a reading. If the residual splits into a part that persists
+and a part that alternates, $r = r_p + r_o$, then
+$\cos = (|r_p|^2 - |r_o|^2)/(|r_p|^2 + |r_o|^2)$, so a threshold $a$ fires once
+the orbit exceeds the progress by $\sqrt{(1-a)/(1+a)}$: three times over at
+$-0.8$, and merely equalling it at $0$.
+
+**Measured over three thresholds.** On the 18-instance grid of section 8.2,
+$-0.5$ and $-0.8$ are the *same run*: over the 36 box-on cases not one differs
+by an iteration or by a currency unit, and the radius ends at $1$ either way.
+Those instances converge in 5.6 iterations without orbiting, so they never
+produce an angle between the two and the threshold never fires. $0$ does fire
+there, and costs for it — 5.6 to 5.8 iterations on average, net +8 over the 36
+runs, worst case 10 to 16 — because it shrinks the radius on instances that
+were never orbiting. The plan is the same in all three (36/36 converged, worst
+cost difference 2e-5 relative).
+
+On the 3 GVA SSSC case of section 8.4 the ordering reverses. At $-0.8$ the
+radius is tightened four times in twelve iterations and the orbit is never
+beaten: the angle stays between $-0.34$ and $-0.92$ and the run ends with a
+residual of 7.9e-5. At $0$ it is tightened on almost every iteration, the radius
+walks $1 	o 0.01$ in seven and back out to $0.02$, the angle turns *positive*
+for the first time on that case ($+0.38$, the orbit finally smaller than the
+progress) and the residual ends at 7.8e-6. Normalised by the radius the two are
+within 10 % of each other, so what the lower threshold buys is not a better step
+but a radius brought down faster — exactly what an orbit needs and what a
+well-behaved instance does not.
+
+$-0.5$ is the default because it is free on the instances that do not orbit and
+fires earlier on the one that does. It has not been measured on the large case;
+the two thresholds either side of it have.
 
 A binding region is required before the radius is widened because a radius that
 does not restrict anything says nothing about the model's range of validity.
-The proximal term has no such test: it is always "binding" in the sense that it
-always charges for the step it admits, so an acceptable error is enough to lower
-its weight.
 
 At a converged point the linearisation reproduces its own point, where the
 constraint coincides with the exact one, so the controls are switched off there
@@ -548,10 +642,12 @@ as a brownfield expansion in which renewable generation, storage, the AC lines
 and, in the SSSC case, the series compensation are co-optimised. Solved with
 Gurobi, `transmission_losses=2`, `cost_threshold=1e-5`.
 
-> These runs predate two changes of scheme B: they used the symmetric trust
-> region and `trust_region_tolerances=(1e-3, 1e-1)`. The comparison of the two
-> schemes is unaffected in kind, but the iteration counts of the trust region
-> should be re-measured with the current defaults.
+> These runs predate three changes of scheme B: they used the symmetric trust
+> region, and a radius steered by the linearisation error with tolerances
+> `(1e-3, 1e-1)` rather than by the angle between consecutive steps
+> (`trust_region_alignment`, section 6.3). The comparison of the two schemes is
+> unaffected in kind, but the iteration counts of the trust region should be
+> re-measured with the current defaults.
 
 ![System cost per iteration for both schemes on the German system with SSSC](img/iterative-expansion-cost-sssc.svg)
 
@@ -736,6 +832,71 @@ $\ell_1$ usable (6/18 against 16/18 in section 8.2). `trust_region=True` is
 therefore the first thing to try on a run that oscillates, that fails to
 converge, or that uses $\ell_1$; it is simply not worth its cost by default.
 
+### 8.4 A period-two orbit, and what removes it
+
+A 2 GW-load subsystem of the WECC — 8563 extendable branches, 8457 of them
+carrying an SSSC, a transmission volume cap and a **total** SSSC budget of
+3 GVA — does not converge in twelve iterations under any control tried here.
+It is worth reporting because the way it fails is specific, and because the
+diagnostics the iteration reports do not show it.
+
+**The failure.** From about the sixth iteration the capacities stop settling and
+start *alternating*. The cosine between consecutive capex-weighted steps runs
+$-0.44, -0.80, -0.93, -0.97$; the distance from the new iterate back to the one
+two steps earlier falls to $0.26$ of the distance it just travelled; and the
+size of the step stops decaying and plateaus. Fifty-two branches alternate
+between two capacities whose ratio is *exactly* $1+
+ho$ — 3933/2622 = 1.5000 at
+$
+ho = 0.5$, and 4872/3897 = 1.2502 once the radius halves. They are bouncing
+between the two walls of their own trust region, and because the region is
+geometrically symmetric a branch that jumps to one wall finds the other wall
+back at its previous capacity. The orbit reproduces itself for as long as the
+radius is held: **the box bounds the amplitude and cannot damp it.**
+
+None of this reaches the log. The residual of the exact voltage law is *small*
+on an orbit (8e-4, falling), and the system cost is flat to $3\cdot10^{-4}$
+over the last seven iterations while 15 % of the capacity moves every one of
+them — so a criterion on either sees a run that is nearly converged.
+
+**Where it comes from.** `capital_cost_sssc` is the same 3640/MVAr on all 8457
+branches and the budget is capped as a total, so moving compensation between
+branches is free to the objective; the allocation is decided entirely by a flow
+pattern that the previous allocation moved. It destabilises first — its own
+cosine is $-0.63$ at the second step, while the capacities are still walking
+forward at $+0.38$ — and it does so bang-bang, one set of branches at full
+rating on odd iterates and zero on even ones, trading with an antiphase set.
+Nothing controls it: the trust region and the proximal term both act on
+`s_nom`, and `sssc_nom` is re-decided from scratch every iterate. Measured and
+ruled out: same-branch substitution (per-branch correlation between the two
+movements is $+0.015$, and the 52 locked branches carry no compensation at
+all), the `sssc_nom` $\le 0.3\,$`s_nom` coupling (binding on **zero** branches
+throughout), and the volume cap (slack at 95.6–95.9 %).
+
+**What removes it.** Steering the radius by the step angle rather than by the
+residual, section 6.3, with everything else identical:
+
+| iteration 12 | residual-driven radius | angle-driven radius |
+| --- | ---: | ---: |
+| step | 0.0832 | **0.0451** |
+| KVL residual | 2.70e-4 | **7.88e-5** |
+| relative cost change | 5.6e-5 | **1.6e-5** |
+| branches locked in the orbit | 79, carrying 23.6 % of the movement | **2, carrying 0.0 %** |
+| SSSC churn over the last four steps | 2455 MW | **1041 MW** |
+| solver work units | — | unchanged to within 1 % |
+
+The residual rule tightened the radius twice in twelve iterations and only by
+accident, on the step size happening to tick up; the angle rule tightened four
+times, on the reversal itself. The loop runs both ways — the SSSC churn halves
+with no intervention on `sssc_nom` at all — so breaking either link damps both.
+
+**What does not remove it.** `damping='auto'` did exactly what it is designed to
+do and made the run worse; see the parameter's own entry. Two boxes on the SSSC
+allocation, at relative width 0.2 and at a uniform 0.5 of the largest rating,
+changed neither the trajectory nor the solver cost outside noise — the uniform
+one measurably because it was 30–60 MW wide against a typical allocation of
+7 MW, i.e. slack on almost every branch it was meant to hold.
+
 ---
 
 ## 9. Algorithm
@@ -773,21 +934,27 @@ while n ≤ n_max:
     if step control active and not converged:  tighten / relax   # step is kept
 
     F_fix ← clip(F*);  g_fix ← g*
-    if converged:
-        complete this iterate's solve in place and assign it;  return
-    costs ← costs + [obj];  n ← n+1
+    costs ← costs + [obj]
+    if converged: break
+    n ← n+1
 
-if not converged:                                      # n_max exhausted
-    set branch impedances from F_fix
-    solve once more, plain formulation (10d), no box, no penalty
+# report solve, always                                 # converged or n_max exhausted
+set branch impedances from F_fix
+pin F_min = F_max = F_fix on branches and DC links
+solve once, plain formulation (10d), no box, no penalty
 ```
 
-The final solve deserves a note. It is reached only without convergence, and it
-is the relaxation with frozen impedances, whose optimum can undercut the
-converged one by expanding capacity without paying for the flow redistribution
-the lower impedance causes. A converged trust region avoids it altogether: the
-linearisation is exact at that point, so the iterate's own solve already reports
-the solution the iteration converged to, with capacities and flows consistent.
+The report solve deserves a note. Its capacities are pinned rather than left
+free, and that is the whole point: with the impedances frozen at
+$F^{\mathrm{fix}}$ the free problem is a relaxation, whose optimum can undercut
+the iterate by expanding capacity without paying for the flow redistribution the
+lower impedance causes. Measured on `test_tr_4_3GVAsssc`, a free report solve
+landed 4.1 % (capital-cost weighted) away from its own linearisation point, with
+a KVL residual of $1.0\cdot10^{-2}$ against the $2.7\cdot10^{-4}$ of the iterate
+it replaced, and an objective 0.33 % below every iterate of the run. Pinned, the
+voltage law it solves is exact — the impedances are those of the capacities it
+holds — so it reports the plan rather than looking for another one, and the two
+exits report the same quantity.
 
 ---
 
@@ -797,16 +964,14 @@ the solution the iteration converged to, with capacities and flows consistent.
 | --- | --- | --- |
 | `scheme` | `"slp"` | inner model, see sections 4 and 5 |
 | `trust_region` | `False` | hard bound on the step, sections 6.1 and 8.3 |
-| `proximal` | `"l2"` | `"off"`, `"l1"` or `"l2"`, section 6.2 |
+| `proximal_target` | `"branches"` | what the term holds: `"branches"`, `"sssc"` or `"both"`, section 6.2 |
 | `cost_threshold` $\varepsilon$ | `1e-5` | convergence tolerance on the system cost |
 | `cost_window` | `1` | consecutive cost changes that must undercut it |
 | `trust_region_initial` $\rho^1$ | `1.0` | initial radius, relative to $\max(F^{n,\mathrm{fix}}, F^0)$ |
 | `trust_region_bounds` | `(1e-2, 1.0)` | $(\rho_{\min}, \rho_{\max})$ |
-| `trust_region_tolerances` | `(1e-5, 1e-2)` | $(\varepsilon_{\mathrm{tgt}}, \varepsilon_{\max})$ |
-| `trust_region_factors` | `(0.5, 2.0)` | $(\sigma, \gamma)$, applied to $\rho$ and to $\delta$ alike |
-| `proximal_metric` | `"capex"` | weight $c_\ell$ of the penalty: `"capex"` or `"uniform"` |
-| `proximal_initial` $\delta^1$ | `l1: 1e-3`, `l2: 0.1` | initial weight; the default L2 setting is fixed at 0.1 |
-| `proximal_bounds` | `l1: (1e-6, 1e-1)`, `l2: (0.1, 0.1)` | $(\delta_{\min}, \delta_{\max})$, per norm; pass wider L2 bounds to opt into adaptation |
+| `trust_region_alignment` | `(-0.8, 0.0)` | $(a_{\mathrm{tighten}}, a_{\mathrm{relax}})$ |
+| `trust_region_factors` | `(0.5, 2.0)` | $(\sigma, \gamma)$, applied to $\rho$ only |
+| `proximal_weight` $\delta$ | `1e-3` | weight of the penalty, fixed for the whole run; `0` switches it off |
 | `sensitivity_tolerance` $\tau$ | `1e-6` | loading below which a branch sensitivity is dropped, see 5.2.2; `0` keeps all |
 | `min_iterations`, `max_iterations` | `1`, `100` | iteration bounds |
 | `track_iterations` | `False` | keep the nominal capacities and objective of every iterate |

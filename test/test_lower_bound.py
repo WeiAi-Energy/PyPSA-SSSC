@@ -75,7 +75,7 @@ def _build_meshed_network(sssc: bool = False, s_nom: float = 50.0) -> pypsa.Netw
 def _trust_region_plan(n: pypsa.Network) -> pd.Series:
     n = n.copy()
     status, condition = n.optimize.optimize_transmission_expansion_iteratively(
-        trust_region=True, max_iterations=40, **NETWORK_SOLVER
+        max_iterations=40, **NETWORK_SOLVER
     )
     assert (status, condition) == ("ok", "optimal")
     return lower_bound.branch_series(n, "s_nom_opt").astype(float)
@@ -311,7 +311,7 @@ def test_certificate_defaults_to_the_plan_in_the_network():
     n = _build_meshed_network()
     solved = n.copy()
     status, condition = solved.optimize.optimize_transmission_expansion_iteratively(
-        trust_region=True, max_iterations=40, **NETWORK_SOLVER
+        max_iterations=40, **NETWORK_SOLVER
     )
     assert (status, condition) == ("ok", "optimal")
 

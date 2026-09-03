@@ -77,8 +77,8 @@ def test_iterative_updates_next_def_from_outer_optimum(monkeypatch):
     assert outer_caps_seen[:2] == [100.0, 150.0]
 
 
-def test_proximal_initial_weight_is_not_relaxed_before_first_linearisation(monkeypatch):
-    """The default L2 proximal weight stays at its default after the first solve."""
+def test_proximal_weight_is_fixed_for_the_whole_run(monkeypatch):
+    """The proximal weight never moves off its default: it is not adapted."""
     n = _build_simple_network()
 
     def fake_optimize(network, snapshots=None, *args, **kwargs):
@@ -98,12 +98,11 @@ def test_proximal_initial_weight_is_not_relaxed_before_first_linearisation(monke
     n.optimize.optimize_transmission_expansion_iteratively(
         max_iterations=3,
         min_iterations=3,
-        proximal="l2",
     )
 
-    # Iteration 1 has no anchor. Every anchored solve uses the fixed default
-    # L2 weight, despite the normal relax/tighten control flow.
-    default = abstract_module.PROXIMAL_INITIAL["l2"]
+    # Iteration 1 has no anchor. Every anchored solve uses the same default
+    # weight; the relax/tighten schedule only moves the radius.
+    default = abstract_module.PROXIMAL_WEIGHT
     assert n.iteration_log.proximal.tolist() == [0.0, default, default]
 
 
@@ -112,15 +111,6 @@ def test_iterative_invalid_switches_raise():
 
     with pytest.raises(ValueError, match="scheme must be one of"):
         n.optimize.optimize_transmission_expansion_iteratively(scheme="newton")
-    with pytest.raises(ValueError, match="proximal must be one of"):
-        n.optimize.optimize_transmission_expansion_iteratively(proximal="l3")
-    # the three switches replaced a single combined 'method' setting, and the
-    # norm used to be its own argument; neither is accepted any more
-    for removed in (dict(method="trust_region"), dict(proximal_norm="l1")):
-        with pytest.raises(TypeError, match="has been removed"):
-            n.optimize.optimize_transmission_expansion_iteratively(**removed)
-
-
 @pytest.mark.parametrize("tolerance", [-1e-9, 1.0])
 def test_iterative_invalid_sensitivity_tolerance_raises(tolerance):
     n = _build_simple_network()
@@ -199,7 +189,7 @@ def test_trust_region_converges_faster_and_consistently(sssc):
     for scheme in ("fixed_point", "slp"):
         n = _build_meshed_network(sssc)
         status, condition = n.optimize.optimize_transmission_expansion_iteratively(
-            scheme=scheme, trust_region=True, proximal="off",
+            scheme=scheme, proximal_weight=0.0,
             max_iterations=40, **SOLVER
         )
         assert status == "ok"
@@ -236,7 +226,7 @@ def test_trust_region_records_iteration_log_and_restores_bounds():
     bounds = n.lines[["s_nom_min", "s_nom_max"]].copy()
 
     n.optimize.optimize_transmission_expansion_iteratively(
-        trust_region=True, max_iterations=20, **SOLVER
+        max_iterations=20, **SOLVER
     )
 
     log = n.iteration_log
@@ -248,6 +238,7 @@ def test_trust_region_records_iteration_log_and_restores_bounds():
         "violation",
         "violation_rel",
         "radius",
+        "alignment",
         "binding",
         "proximal",
         "accepted",
@@ -259,6 +250,179 @@ def test_trust_region_records_iteration_log_and_restores_bounds():
     # the trust region must not leak into the network
     pd.testing.assert_frame_equal(n.lines[["s_nom_min", "s_nom_max"]], bounds)
     assert n._kvl_capacity_sensitivity is None
+
+
+
+def test_radius_follows_the_angle_between_consecutive_steps():
+    """
+    The radius is steered by the direction of the step and by nothing else: a
+    step that reverses its predecessor shrinks it, a run of aligned steps
+    against the boundary widens it, and neither happens on the first step,
+    which has no predecessor to be compared with.
+    """
+    n = _build_meshed_network()
+    n.optimize.optimize_transmission_expansion_iteratively(
+        max_iterations=20, **SOLVER
+    )
+
+    log = n.iteration_log
+    assert np.isnan(log.alignment.iloc[0])
+    assert log.alignment.dropna().between(-1.0, 1.0).all()
+
+    shrink, expand = 0.5, 2.0
+    for (_, before), (_, after) in zip(log.iloc[:-1].iterrows(), log.iloc[1:].iterrows()):
+        if np.isnan(before.alignment) or np.isnan(after.radius):
+            continue
+        if before.alignment <= -0.8:
+            expected = max(before.radius * shrink, 1e-2)
+        elif before.alignment >= 0.0 and before.binding:
+            expected = min(before.radius * expand, 1.0)
+        else:
+            expected = before.radius
+        assert after.radius == pytest.approx(expected)
+
+
+
+@pytest.mark.parametrize("sssc", [False, True])
+def test_unconverged_run_reports_its_last_iterate(sssc):
+    """
+    A run that exhausts its budget closes with a solve that costs the last
+    iterate. That solve is linearised at the last iterate, so it has to be
+    taken *at* it: released, it walks away from the point its own impedances
+    came from and buys an objective the network cannot deliver.
+    """
+    n = _build_meshed_network(sssc)
+    bounds = {c: n.df(c)[["s_nom_min", "s_nom_max"]].copy() for c in ("Line", "LineX")
+              if not n.df(c).empty}
+
+    n.optimize.optimize_transmission_expansion_iteratively(
+        max_iterations=2, track_iterations=True, **SOLVER
+    )
+
+    assert len(n.iteration_log) == 2, "the run has to be the unconverged one"
+    for c, before in bounds.items():
+        df = n.df(c)
+        ext = df.s_nom_extendable
+        if ext.any():
+            # the plan returned is the last iterate, at the impedances that
+            # iterate defines, so the two agree and the voltage law is exact
+            pd.testing.assert_series_equal(
+                df.s_nom_opt[ext], df._s_nom_def[ext],
+                rtol=1e-9, check_names=False,
+            )
+            pd.testing.assert_series_equal(
+                df.s_nom_opt[ext], df.s_nom_opt_2[ext],
+                rtol=1e-9, check_names=False,
+            )
+        # and the bounds it was held at do not leak out of the call
+        pd.testing.assert_frame_equal(df[["s_nom_min", "s_nom_max"]], before)
+
+
+
+def test_converged_run_is_also_closed_by_the_report_solve():
+    """
+    The run that converges is closed by the same pinned report solve as the one
+    that runs out of budget. At a converged point the linearisation is exact, so
+    that solve reproduces the iterate rather than moving away from it - but it
+    is what carries the duals and the derived time series, and it carries
+    neither the trust region nor the penalty.
+    """
+    n = _build_meshed_network()
+    bounds = n.lines[["s_nom_min", "s_nom_max"]].copy()
+
+    n.optimize.optimize_transmission_expansion_iteratively(
+        max_iterations=40, track_iterations=True, **SOLVER
+    )
+
+    log = n.iteration_log
+    assert len(log) < 40, "the run has to be the converged one"
+    ext = n.lines.s_nom_extendable
+    # the report solve is held at the converged capacities
+    pd.testing.assert_series_equal(
+        n.lines.s_nom_opt[ext], n.lines._s_nom_def[ext],
+        rtol=1e-9, check_names=False,
+    )
+    pd.testing.assert_series_equal(
+        n.lines.s_nom_opt[ext], n.lines[f"s_nom_opt_{len(log)}"][ext],
+        rtol=1e-9, check_names=False,
+    )
+    # and reproduces the cost the iteration converged to
+    assert n.objective == pytest.approx(float(log.cost.dropna().iloc[-1]), rel=1e-9)
+    # it is the plain formulation: no step control of either kind survives it
+    assert "Line-s_nom_deviation" not in n.model.variables
+    assert n._kvl_capacity_sensitivity is None
+    pd.testing.assert_frame_equal(n.lines[["s_nom_min", "s_nom_max"]], bounds)
+    # and it is a full solve, so the user-facing results are there
+    assert not n.buses_t.marginal_price.empty
+
+
+def test_proximal_target_is_validated():
+    n = _build_simple_network()
+
+    with pytest.raises(ValueError, match="proximal_target must be one of"):
+        n.optimize.optimize_transmission_expansion_iteratively(
+            proximal_target="lines"
+        )
+
+
+def test_proximal_on_the_compensation_warns_where_there_is_none(caplog):
+    """A network without an extendable SSSC has nothing for the term to hold."""
+    n = _build_meshed_network(sssc=False)
+
+    with caplog.at_level("WARNING"):
+        n.optimize.optimize_transmission_expansion_iteratively(
+            proximal_target="sssc", max_iterations=20, **SOLVER
+        )
+
+    assert any("sssc_nom_extendable" in r.message for r in caplog.records)
+
+
+def test_sssc_proximal_does_not_move_the_converged_plan():
+    """
+    On the compensation the ``l2`` term is a step control, not a preference: it
+    vanishes with its own gradient where the iterate reproduces its anchor, so
+    the plan the iteration settles on must not depend on how hard it charged
+    for getting there - as long as the weight stays below the point at which
+    its dead zone starts deciding the plan instead.
+    """
+    plans = {}
+    for weight in (1e-4, 1e-3):
+        n = _build_meshed_network(sssc=True)
+        n.optimize.optimize_transmission_expansion_iteratively(
+            proximal_target="sssc",
+            proximal_weight=weight,
+            max_iterations=40,
+            **SOLVER,
+        )
+        log = n.iteration_log
+        plans[weight] = (
+            _branch_capacities(n),
+            n.line_xs.sssc_nom_opt.astype(float),
+            float(log.cost.dropna().iloc[-1]),
+            float(log.violation_rel.dropna().iloc[-1]),
+        )
+
+    (caps_a, q_a, cost_a, res_a), (caps_b, q_b, cost_b, res_b) = (
+        plans[1e-4],
+        plans[1e-3],
+    )
+    # both have to have converged for the comparison to mean anything
+    assert res_a < 1e-4 and res_b < 1e-4
+    assert cost_b == pytest.approx(cost_a, rel=1e-4)
+    pd.testing.assert_series_equal(caps_b, caps_a, rtol=1e-3, check_names=False)
+    # the compensation is the quantity the term acts on, so it is the one that
+    # would show a bias
+    assert float((q_b - q_a).abs().sum()) <= 1e-2 * max(float(q_a.sum()), 1.0)
+
+
+def test_alignment_thresholds_are_validated():
+    n = _build_simple_network()
+
+    for bad in ((-2.0, 0.0), (0.5, -0.5), (-0.8, 1.5)):
+        with pytest.raises(ValueError, match="trust_region_alignment"):
+            n.optimize.optimize_transmission_expansion_iteratively(
+                trust_region_alignment=bad
+            )
 
 
 @pytest.mark.parametrize("track_iterations", [False, True])
@@ -281,7 +445,6 @@ def test_iterations_only_assign_the_final_network_solution(
         monkeypatch.setattr(optimize_module, function.__name__, wrapped)
 
     status, condition = n.optimize.optimize_transmission_expansion_iteratively(
-        trust_region=True,
         max_iterations=1,
         track_iterations=track_iterations,
         solver_name="highs",
@@ -325,7 +488,6 @@ def test_trust_region_is_geometrically_symmetric():
         )
 
     n.optimize.optimize_transmission_expansion_iteratively(
-        trust_region=True,
         max_iterations=20,
         extra_functionality=record,
         **SOLVER,
@@ -338,10 +500,12 @@ def test_trust_region_is_geometrically_symmetric():
             region["s_nom_min"],
             region["s_nom_max"],
         )
-        # iterations without a linearisation carry the original bounds, and the
+        # iterations without a linearisation carry the original bounds, the
         # width is floored by the initial capacity, which breaks the geometric
-        # symmetry on purpose. Neither is what this test is about.
-        interior = np.isfinite(upper) & (centre >= initial)
+        # symmetry on purpose, and the solve that closes an unconverged run
+        # holds the capacities at the last iterate rather than boxing them.
+        # None of the three is what this test is about.
+        interior = np.isfinite(upper) & (centre >= initial) & (upper > lower)
         if not interior.any():
             continue
         centre, lower, upper = centre[interior], lower[interior], upper[interior]
@@ -394,73 +558,44 @@ def test_proximal_term_does_not_distort_the_optimum():
     carry no such statement.
     """
     costs = {}
-    for proximal in ("off", "l1", "l2"):
+    for proximal in (0.0, abstract_module.PROXIMAL_WEIGHT):
         n = _build_meshed_network()
+        inner = []
+
+        def observe(network, sns, _seen=inner):
+            # the penalty is added before the caller's hook runs, so this sees
+            # the inner problem of an iteration as it is solved
+            _seen.append(
+                (
+                    "Line-s_nom_deviation" in network.model.variables,
+                    bool(network.model.objective.is_quadratic),
+                )
+            )
+
         n.optimize.optimize_transmission_expansion_iteratively(
-            trust_region=True, proximal=proximal, max_iterations=40, **SOLVER
+            proximal_weight=proximal,
+            max_iterations=40,
+            extra_functionality=observe,
+            **SOLVER,
         )
         log = n.iteration_log
         costs[proximal] = float(log.cost.dropna().iloc[-1])
-        # only the l1 term needs a deviation variable; l2 goes straight into the
-        # objective and makes it quadratic
-        assert ("Line-s_nom_deviation" in n.model.variables) == (proximal == "l1")
-        assert bool(n.model.objective.is_quadratic) == (proximal == "l2")
-        # the weight is adapted, not given, and reported per iteration
-        assert (log.proximal.fillna(0.0) > 0.0).any() == (proximal != "off")
+        on = proximal > 0.0
+        # the term is modelled with a deviation variable, so the inner problem
+        # stays linear whether it is on or off. Iteration 1 has no anchor yet
+        # and so carries no penalty either way.
+        assert any(present for present, _ in inner[:-1]) == on
+        assert not any(quadratic for _, quadratic in inner)
+        # the report solve that closes the run carries no penalty either way,
+        # so the model left on the network never has the deviation variable
+        assert inner[-1][0] is False
+        assert "Line-s_nom_deviation" not in n.model.variables
+        assert not bool(n.model.objective.is_quadratic)
+        # and the weight it was solved with is reported per iteration
+        assert (log.proximal.fillna(0.0) > 0.0).any() == on
 
-    for norm in ("l1", "l2"):
-        assert abs(costs[norm] - costs["off"]) / abs(costs["off"]) < 1e-3
-
-
-def test_l2_drops_numerically_zero_anchor_cross_terms(monkeypatch):
-    """A zero anchor or residual tiny L2 summand must not reach the solver."""
-    n = _build_meshed_network()
-    # This represents a candidate whose capacity is zero up to solver
-    # feasibility tolerance. It stays in the voltage-law model but cannot be
-    # selected by the first (LP) iteration.
-    n.lines.loc["ab", ["s_nom", "s_nom_min", "s_nom_max"]] = 1e-16
-
-    original_solve = linopy.Model.solve
-    calls = 0
-    captured = {}
-
-    def capture_second_model(model, *args, **kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            captured["data"] = model.objective.data
-            raise RuntimeError("captured second iteration")
-        return original_solve(model, *args, **kwargs)
-
-    def add_tiny_objective_summand(network, snapshots):
-        # Linopy preserves separate summands until model export. This mimics
-        # the tiny linear residue that can remain after a real L2 expansion.
-        network.model.objective += 2e-13 * network.model["Line-s_nom"].sel(
-            **{"Line-ext": "ac"}
-        )
-
-    monkeypatch.setattr(linopy.Model, "solve", capture_second_model)
-    with pytest.raises(RuntimeError, match="captured second iteration"):
-        n.optimize.optimize_transmission_expansion_iteratively(
-            max_iterations=3,
-            min_iterations=2,
-            solver_name="highs",
-            solver_options={"log_to_console": False},
-            transmission_losses=2,
-            extra_functionality=add_tiny_objective_summand,
-        )
-
-    labels = captured["data"].vars.values
-    coeffs = captured["data"].coeffs.values
-    linear = labels[1] == -1
-    net = np.bincount(
-        labels[0, linear],
-        weights=coeffs[linear],
-        minlength=int(labels[0, linear].max()) + 1,
-    )
-    nonzero = np.abs(net)
-    nonzero = nonzero[nonzero > 0.0]
-    assert nonzero.min() >= 1e-6
+    off, on = costs[0.0], costs[abstract_module.PROXIMAL_WEIGHT]
+    assert abs(on - off) / abs(off) < 1e-3
 
 
 def test_kvl_capacity_sensitivity_enters_constraint():
