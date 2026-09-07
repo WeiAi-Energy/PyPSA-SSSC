@@ -6,7 +6,6 @@ Linopy.
 
 from __future__ import annotations
 
-import copy
 import gc
 import logging
 from collections.abc import Mapping, Sequence
@@ -29,31 +28,37 @@ if TYPE_CHECKING:
     from pypsa import Network
 logger = logging.getLogger(__name__)
 
-# Weight of the proximal term. It is fixed for the whole run: the weight is a
-# property of the problem, not a state of the iteration, and the schedule that
-# used to adapt it never fired on the cases it was meant for - its triggers
-# needed a KVL residual outside a pair of tolerances, while a run spends its
-# iterations between them. Only the trust region radius is adapted now, and off
-# the angle between consecutive steps rather than that residual.
+# Factor the proximal weight is multiplied by when ``proximal_adaptive`` sees
+# the iteration turn. Doubling is the coarsest response that recovers a step
+# which is too long by any margin, in a bounded number of iterations.
+PROXIMAL_ADAPTIVE_FACTOR = 2.0
+
+# Bar on the displacement measure below which ``proximal_adaptive`` reads the
+# iteration as turning rather than walking.
 #
-# The weight is the share of the capital cost of a branch the term charges for
-# moving it by its own size, so it is dimensionless.
+# Measured on a 1250 bus case against the share of each step that actually
+# closed the distance to the converged plan: while the iteration walks, that
+# share runs 0.42 to 0.70 and the measure reads 0.77 to 0.94; once it stalls,
+# the share collapses to 0.05 to 0.31 - individual steps ending *further* from
+# the answer than they started - and the measure reads 0.46 to 0.68. The two
+# bands meet rather than leaving a gap, so the bar is a boundary drawn inside a
+# continuum, not a value picked out of an empty interval.
 #
-# The term has a dead zone: at the anchor its subgradient is ``delta * c_l``
-# times ``[-1, 1]``, so no move worth less than that per MW is taken at all,
-# and the converged point is only optimal to within it. That is what makes it
-# selective - a reallocation between two plans of equal cost gains nothing and
-# is refused, while a move worth more than the hurdle is taken at full size -
-# and it is also how it goes wrong. Measured on the meshed brownfield system
-# over five decades of the weight, the bias of the converged cost stays below
-# 1e-4 relative up to ``1e-1`` and then jumps to between two and eleven per cent
-# at ``1``, while the iteration count *falls*: the term freezes the iterate and
-# the convergence test reads the freeze as convergence. ``1e-1`` is therefore
-# the last decade in which the term perturbs the objective rather than deciding
-# the plan. The term cannot be relied on as the only step control: the weight it
-# would need to control a large step is past the point where it distorts the
-# answer.
-PROXIMAL_WEIGHT = 1e-3
+# What holds it down here rather than up against the stalling band is the
+# iterate that immediately follows a doubling. Its step was solved under a
+# different penalty from the one before it, so the measure compares two steps
+# from two regimes and reads low for that reason alone: 0.48 to 0.65 on runs
+# that were not turning at all, one of them closing 69 % of its own remaining
+# distance. A bar above those readings would raise the weight again on the
+# strength of an artefact, on every doubling.
+PROXIMAL_TURN_BAR = 0.65
+
+# A window of steps that moves less than this share of the capital of the plan
+# itself is numerical noise rather than a direction. Below it the iterate is
+# read as a fixed point, which is what keeps the rule from ratcheting the
+# weight up on a run that has already stopped.
+PROXIMAL_STEP_FLOOR = 1e-9
+
 
 @dataclass
 class TransmissionIterationResult:
@@ -71,20 +76,17 @@ class TransmissionIterationResult:
 def optimize_transmission_expansion_iteratively(
     n: Network,
     snapshots: Sequence | None = None,
-    msq_threshold: float | None = None,
     min_iterations: int = 1,
     max_iterations: int = 100,
     track_iterations: bool = False,
     scheme: str = "slp",
-    proximal_target: str = "branches",
+    proximal: bool = True,
     cost_threshold: float = 1e-5,
-    cost_window: int = 1,
-    proximal_weight: float | None = None,
-    trust_region_initial: float = 1.0,
-    trust_region_bounds: tuple[float, float] = (1e-2, 1.0),
-    trust_region_alignment: tuple[float, float] = (-0.5, 0.0),
-    trust_region_factors: tuple[float, float] = (0.3, 3.0),
-    sensitivity_tolerance: float = 1e-6,
+    step_threshold: float = 0.01,
+    proximal_weight: float = 0.5,
+    proximal_adaptive: bool = True,
+    proximal_ceiling: float = 4.0,
+    sensitivity_tolerance: float = 1e-5,
     **kwargs: Any,
 ) -> tuple[str, str]:
     """
@@ -105,13 +107,6 @@ def optimize_transmission_expansion_iteratively(
     snapshots : list or index slice
         A list of snapshots to optimise, must be a subset of
         network.snapshots, defaults to network.snapshots
-    msq_threshold: float, optional
-        Deprecated and ignored. The relative change of the transmission
-        capacities is a step size, not a measure of convergence: on meshed
-        networks degenerate alternative optima keep it bouncing long after the
-        solution has settled, while a step can be small by accident. It is
-        still reported as ``step`` in ``n.iteration_log`` as a diagnostic, but
-        convergence is decided by ``cost_threshold``.
     min_iterations : integer, default 1
         Minimal number of iterations to run regardless whether the convergence
         criterion is already met
@@ -136,7 +131,10 @@ def optimize_transmission_expansion_iteratively(
             The impedance and the SSSC compensation term are frozen at the
             capacity of the previous iterate, so the KVL constraint stays
             zeroth-order in the capacity and every inner problem is the plain
-            linear expansion problem.
+            linear expansion problem. There is no linearisation error for a
+            step restriction to control, so the step control is off and the
+            ``proximal_*`` arguments are ignored: the step is the bare fixed
+            point.
         ``'slp'``
             Sequential linear programming: the KVL constraint carries the
             first-order sensitivity of its branch terms with respect to the
@@ -148,110 +146,195 @@ def optimize_transmission_expansion_iteratively(
             reproduces the converged iterate rather than moving away from it.
 
         A linearisation is only valid over a limited step, which is what
-        the step controls are for. Every solved iterate is
-        accepted however large the residual it leaves; the controls only narrow
-        the *next* step. With both off, ``'slp'`` is a bare Gauss-Newton
-        iteration, and on a meshed network it oscillates instead of
-        converging.
+        the proximal term below is for, and it therefore applies to
+        ``'slp'`` alone. Every solved iterate is accepted however large the
+        residual it leaves; the term only narrows the *next* step. With it
+        off, ``'slp'`` is a bare Gauss-Newton iteration, and on a meshed
+        network it oscillates instead of converging - which is what
+        ``'fixed_point'`` is, one order lower.
     cost_threshold : float, default 1e-5
-        Convergence criterion: the iteration stops once the system cost has
-        changed by less than this fraction of itself in each of the last
-        ``cost_window`` accepted iterations. The cost is invariant under the
-        exchange of degenerate alternative optima, which the change of the
-        capacities is not, and it is the quantity the results are reported in.
-    cost_window : int, default 1
-        Number of consecutive relative cost changes that have to undercut
-        ``cost_threshold``.
-    proximal_weight : float, optional
-        Weight ``delta`` of the proximal term, fixed for the whole run, default
-        ``PROXIMAL_WEIGHT``. The term penalises moving the capacity of branch
-        ``l`` away from the previous iterate ``F_l'`` in units of its capital
-        cost ``c_l``,
+        Convergence criterion on the system cost: the relative change of the
+        cost from the previous accepted iterate has to be at or below this.
+        The cost is invariant under the exchange of degenerate alternative
+        optima, which the change of the capacities is not, and it is the
+        quantity the results are reported in.
 
-        ``delta * sum_l c_l |F_l - F_l'|``,
+        It is not sufficient on its own, which is why ``step_threshold`` is
+        tested with it: the cost is *stationary along the directions an orbit
+        turns in*, so a run that has settled into a limit cycle rather than
+        onto a fixed point passes this test while its plan is still moving.
+    step_threshold : float, default 0.01
+        Convergence criterion on the size of the step, tested together with
+        ``cost_threshold`` and on the same iterate: the relative change of the
+        transmission capacities has to be at or below this. ``0`` switches the
+        test off, leaving the cost test alone.
 
-        modelled with a non-negative deviation variable per branch, so the
-        inner problem stays a linear program. ``delta`` is the share of the
-        capital cost of a branch the term charges for moving it by its own
-        size, hence dimensionless.
+        The step is the gap between the plan a solve returns and the
+        capacities its own impedances were taken at, measured in the
+        capital-cost weighted Euclidean norm and referred to the initial
+        capacities,
+
+        ``sqrt(sum_l c_l (s_nom_opt - _s_nom_def)**2 / sum_l c_l s_nom_0**2)``,
+
+        so this bounds how much of the plan's *capital* is still undetermined
+        when the run stops. It is weighted with the same capital cost the
+        proximal term charges in, so the quantity that is damped and the
+        quantity that is tested are the same one. It is what separates a fixed point
+        from an orbit, and it is also the only signal that catches a run held
+        together by its own damping: a heavy proximal weight shortens the step,
+        the change of the cost and the KVL residual alike, so the cost test can
+        be met by damping rather than by stationarity. A damped iterate is
+        still moving; a converged one is not.
+
+        Where the alternative optima are degenerate the step can floor above
+        any useful bar - the cost is then fully determined while the plan is
+        not - so loosen it, rather than waiting, on a system whose plan is
+        inherently indeterminate.
+    proximal : bool, default True
+        Whether ``scheme='slp'`` damps its step with the proximal term on the
+        extendable ``Line`` and ``LineX`` capacities, which are its only
+        target. ``False`` switches the term off, as ``proximal_weight=0`` does.
+
+        The term is
+
+        ``delta * sum_l c_l (F_l - F_l')**2 / F_l'``,
+
+        scaled by the previous capacity ``F_l'``. A scaled free deviation
+        variable gives the QP identical diagonal quadratic coefficients and
+        puts the branch-specific scaling in linear defining equalities.
+
+        Its gradient vanishes at the anchor, which is the property the rest of
+        the iteration is built on: a fixed point of the penalised step is a
+        fixed point of the unpenalised problem, so the converged plan does not
+        depend on the weight the run needed to reach it.
+    proximal_weight : float, default 0.5
+        Weight ``delta`` of the proximal term, used by ``scheme='slp'`` only,
+        and fixed for the whole run. The term penalises moving the capacity of
+        branch ``l`` away from the previous iterate ``F_l'`` in units of its
+        capital cost ``c_l``: it charges ``delta`` times the branch's capital
+        cost for moving it by its own size, so ``delta`` is dimensionless.
+
+        Each system has a stability boundary below which the iteration turns
+        in a limit cycle instead of contracting; it is a property of the system
+        rather than of this default, so a run that oscillates wants a larger
+        weight.
+
+        Raising the weight is safe in a way that bounding the step is not,
+        because a *fixed point* of the penalised step is a fixed point of the
+        unpenalised problem - the gradient of the term vanishes at the anchor -
+        so the converged plan does not depend on the weight the run needed to
+        reach it. A point the iteration merely *stopped at* is a different
+        matter: a heavier weight shortens every step like a damping factor, and
+        with the step it shortens the change of the cost and the KVL residual
+        too, so the convergence signals can be produced by the damping rather
+        than by stationarity. Read ``step`` in ``n.iteration_log`` to tell the
+        two apart - a damped iterate is still moving, a converged one is not.
 
         It doubles as a hurdle rate on capital reallocation: the subgradient at
         the anchor is ``delta * c_l`` times ``[-1, 1]``, so a branch is moved
         only where the move returns more than ``delta`` of the capital it
-        shifts. That dead zone is what makes the term selective - a reallocation
-        between two plans of equal cost gains nothing and is refused, while a
-        move worth more than the hurdle is taken at full size - and it is also
-        how the term can go wrong: past about ``1e-1`` on the systems this was
-        measured on, the dead zone decides the plan rather than damping the
-        iteration, and a frozen iterate reports itself as a converged one.
+        shifts. That dead zone is what makes the term selective - a
+        reallocation between two plans of equal cost gains nothing and is
+        refused, while a move worth more than the hurdle is taken at full size.
+        It is also how the term can go wrong: a large enough weight lets the
+        dead zone decide the plan rather than damp the iteration, and a frozen
+        iterate reports itself as a converged one.
 
         ``0`` switches the term off.
-    proximal_target : {'branches', 'sssc', 'both'}, default 'branches'
-        What the term holds: the branch capacities, the series compensation
-        ``sssc_nom``, or both under the one weight.
 
-        ``'sssc'`` exists because the compensation is the one degree of freedom
-        the iteration otherwise leaves uncontrolled - the trust region and the
-        term itself both act on the capacities - and because on a network that
-        prices compensation per MVAr at one rate and caps only its total, moving
-        it from one branch to another is free to the objective. The allocation
-        is then decided entirely by a flow pattern that the previous allocation
-        moved, and it answers bang-bang: measured, one set of branches carries
-        its full rating on odd iterates and nothing on even ones, trading with
-        an antiphase set, and it reverses direction before the capacities do.
+        Since ``proximal_adaptive`` is on by default, this is the *initial*
+        weight rather than the weight of the whole run.
+    proximal_adaptive : bool, default True
+        Whether the weight is raised during the run when the step outruns the
+        linearisation it was taken on.
 
-        A dead zone is the right instrument for that, and the objection that
-        makes a uniform weight wrong for the capacities - it charges a cheap
-        branch a larger share of its own cost than an expensive one - does not
-        apply here, since the underlying rate really is uniform.
+        With ``False`` the weight is a constant. With ``True`` it is doubled
+        once *two consecutive* iterates, both solved under the same weight,
+        report that most of the capital their steps moved was moved back
+        again:
 
-        ``'both'`` shares one weight between two terms whose scales need not
-        agree, so it is only useful where they happen to.
-    trust_region_initial : float, default 1.0
-        Initial trust region radius. The
-        capacity of branch ``l`` is restricted to
+        ``progress < 0.5 twice in a row at one delta  =>  delta <- 2 * delta``
 
-        ``F_def_l - radius / (1 + radius) * S_l <= F_l <= F_def_l + radius * S_l``
+        ``progress`` is the share of the moved capital that is net
+        displacement over those two steps - one if every branch walked in one
+        direction, zero if every branch came back - and it is reported per
+        accepted iterate in ``n.iteration_log``. It reads the direction of the
+        movement and its size together; see ``displacement`` for why neither
+        alone is enough, and ``PROXIMAL_TURN_BAR`` for where the bar comes
+        from and what holds it down.
 
-        with ``S_l = max(F_def_l, F0_l)``, i.e. the radius is relative to the
-        capacity of the linearisation point, floored by the initial capacity.
-        The region is wider above the linearisation point than below it, which
-        for ``S_l = F_def_l`` makes it the geometrically symmetric interval
-        ``F_def_l / (1 + radius) <= F_l <= F_def_l * (1 + radius)``. That is the
-        natural symmetry of the branch terms of the voltage law, which scale
-        with the inverse capacity, and it leaves the same linearisation error at
-        both ends; a symmetric region would tolerate a much larger error on the
-        side where the capacity shrinks.
-    trust_region_bounds : tuple of float, default (1e-2, 1.0)
-        Smallest and largest admissible trust region radius. The radius
-        saturates at the lower bound; the iteration then continues at that
-        radius until it converges or ``max_iterations`` runs out.
-    trust_region_alignment : tuple of float, default (-0.5, 0.0)
-        Thresholds ``(tighten, relax)`` on the angle between the fixed-point
-        residuals ``G(z) - z`` of two consecutive steps, weighted with the cost
-        of the capacity they move. At a cosine of ``tighten`` or below the step
-        undid the one before it and the radius is shrunk; at ``relax`` or above
-        the iteration is walking one way and the radius is expanded if it was
-        binding. In between the radius is left alone. The step itself is kept
-        either way - a solved iterate is never discarded.
+        The count restarts whenever a reading clears the bar and whenever the
+        weight changes, so the first reading after a doubling - which compares
+        two steps solved under different penalties and reads low for that
+        reason alone - can arm the gate but can never trip it on its own. What
+        the gate buys is that a single pair of steps that happen to disagree no
+        longer damps a run that is walking; what it costs is one extra iterate
+        per doubling on a run that really is turning, an orbit reading low on
+        every iterate it runs for.
 
-        The angle is what the radius has to be steered by here. An expanding
-        branch lowers its own impedance and attracts flow, which the next
-        model answers by shrinking it again, and where that feedback is
-        reflecting rather than contracting the iteration settles into an orbit
-        of period two. Neither of the quantities the iteration used to be
-        steered by sees it: the residual of the voltage law is small on an
-        orbit, and the size of the step is flat rather than growing. The
-        radius is nonetheless the control that resolves it. The region is
-        geometrically symmetric, so a branch that jumps to one wall finds the
-        other wall exactly back at its previous capacity - the orbit lives on
-        the walls, reproduces itself for as long as the radius is held, and
-        shrinks in proportion to it.
-    trust_region_factors : tuple of float, default (0.5, 2.0)
-        Factors ``(shrink, expand)`` the trust region radius is multiplied
-        with. The weight of the proximal
-        term is not adapted and these do not apply to it.
-    sensitivity_tolerance : float, default 1e-6
+        It is on by default because the systems it is aimed at cannot be
+        recognised in advance and fail silently when it is off: a weight below
+        the system's stability boundary produces a *converged* run whose plan
+        is still moving. Measured on a 1250 bus case (2435 extendable
+        branches, 36 snapshots), the default weight of 1.0 held fixed stops on
+        a period-2 orbit at iteration 16 with a relative KVL residual of
+        1.6e-4, while the rule from the same start converges at iteration 18
+        with 8.7e-7 - and beats the best fixed weight on that system, 2.5, by
+        five iterations. That run predates the confirmation gate described
+        above, which delays each doubling by one iterate; what it establishes
+        is the failure the rule prevents, not the iteration count it reaches
+        now.
+
+        It costs nothing on a system that never needed it, which earlier
+        signals did not manage: on the small meshed test system, where a fixed
+        weight of 1.0 reaches an exact fixed point in 16 iterations, the rule
+        reproduces that run iterate for iterate and never raises the weight,
+        ``progress`` staying between 0.87 and 1.00. Triggering on a rise in the
+        step took 29 iterations there and triggering on a rise in the KVL
+        residual 30, both by damping a run that was already converging.
+
+        The weight is never released again, and it is bounded above by
+        ``proximal_ceiling``. A fixed point of the penalised step is a fixed
+        point of the unpenalised problem, so a weight that ends up too high
+        costs iterations but does not move the plan it converges to, whereas
+        releasing it re-opens the oscillation it was raised to close.
+
+        The rule needs the ceiling because a cosine is meaningless once the
+        steps are numerical noise: the sign is then random, so half the
+        iterates of a run that has already stopped would be read as turns and
+        ratchet the weight up. ``PROXIMAL_STEP_FLOOR`` catches the clearly dead
+        case - a window moving less than 1e-9 of the plan's own capital is read
+        as a fixed point rather than as a direction - and the ceiling bounds
+        whatever gets through.
+
+        The rule is aimed at the false convergence a fixed weight below the
+        system's stability boundary produces: the iteration settles into an
+        orbit in which the cost is stationary - the cost is flat along the
+        directions an orbit turns in - while the plan is still moving. Such a
+        run passes the cost test of ``cost_threshold`` and reports itself
+        converged at an iterate whose ``step`` is still large. Reading ``step``
+        on the last row of ``n.iteration_log`` is what detects it.
+    proximal_ceiling : float, default 4.0
+        Upper bound on the weight ``proximal_adaptive`` raises, in the same
+        dimensionless units as ``proximal_weight``. Ignored when the rule is
+        off, since a constant weight needs no bound. It has to be at least
+        ``proximal_weight``.
+
+        The default is what the rule needed on the systems this was measured
+        on rather than a safety margin above them: on the 1250 bus case the
+        weight settled at 3 to 4 and never approached a higher bound, and on
+        the small meshed system a bound of 4 was the difference between
+        reaching the fixed point in 30 iterations and still moving after 40.
+        Raise it for a system whose stability boundary is known to be higher,
+        at the price of the over-damping described above.
+
+        A ceiling is safe in a way that it would not be for a step bound,
+        because the weight does not decide the plan the iteration converges to,
+        only how fast it gets there; what the ceiling costs is the ability to
+        damp a system whose stability boundary lies above it, which shows up as
+        a run that keeps oscillating at the ceiling rather than one that
+        reports a wrong answer.
+    sensitivity_tolerance : float, default 1e-5
         Relative size below which the linearisation of ``scheme='slp'`` drops
         a branch sensitivity, measured against the voltage drop that
         branch causes at its rated capacity. The sensitivity is proportional to
@@ -266,37 +349,52 @@ def optimize_transmission_expansion_iteratively(
     Returns
     -------
     status, condition : str, str
-        Status and termination condition of the final optimization. The
-        convergence history is written to ``n.iteration_log``.
+        Status and termination condition of the report solve that closes the
+        run at the capacities of its last iterate. The convergence history is
+        written to ``n.iteration_log``.
     """
     schemes = ("slp", "fixed_point")
     if scheme not in schemes:
         raise ValueError(f"scheme must be one of {schemes}, got {scheme!r}.")
-    if msq_threshold is not None:
-        logger.warning(
-            "'msq_threshold' is ignored, convergence is decided by the relative "
-            "change of the system cost ('cost_threshold'). The relative change "
-            "of the capacities remains available as 'step' in n.iteration_log."
-        )
     cost_threshold = float(cost_threshold)
-    cost_window = int(cost_window)
+    step_threshold = float(step_threshold)
     # the weight doubles as the switch: zero leaves the term out of the model
-    proximal_on = proximal_weight is None or float(proximal_weight) > 0.0
-    proximal_targets = ("branches", "sssc", "both")
-    if proximal_target not in proximal_targets:
-        raise ValueError(
-            f"proximal_target must be one of {proximal_targets}, "
-            f"got {proximal_target!r}."
-        )
+    proximal_on = proximal and float(proximal_weight) > 0.0
+    # The scheme decides both what the inner problem is and what restricts its
+    # step. It is resolved into the switches the iteration reads here, once,
+    # rather than tested again at each of them.
+    if scheme == "slp":
+        # the voltage law is linearised in the capacities, and the proximal
+        # term is there to keep that linearisation valid over the step
+        linearised = True
+    else:
+        # ``'fixed_point'``: the voltage law is frozen rather than linearised,
+        # so there is no linearisation error for a control to keep small. The
+        # step control is off and the inner problem is the plain linear
+        # expansion problem, taken at the bare fixed-point step.
+        linearised = False
+        if proximal_on:
+            logger.info(
+                "The proximal term is inactive under scheme='fixed_point', "
+                "which takes the plain fixed-point step. Use scheme='slp' for "
+                "a damped iteration, or proximal=False to silence this.",
+            )
+        proximal_on = False
     if cost_threshold < 0.0:
         raise ValueError("cost_threshold must be >= 0.")
-    if cost_window < 1:
-        raise ValueError("cost_window must be >= 1.")
-    if proximal_weight is None:
-        proximal_weight = PROXIMAL_WEIGHT
+    if step_threshold < 0.0:
+        raise ValueError("step_threshold must be >= 0; zero switches the test off.")
     proximal_weight = float(proximal_weight)
     if proximal_weight < 0.0:
         raise ValueError("proximal_weight must be >= 0; zero switches the term off.")
+    proximal_adaptive = bool(proximal_adaptive)
+    proximal_ceiling = float(proximal_ceiling)
+    if proximal_adaptive and proximal_ceiling < proximal_weight:
+        raise ValueError(
+            "proximal_ceiling must be >= proximal_weight; it bounds the weight "
+            f"the adaptive rule raises from it, got {proximal_ceiling} < "
+            f"{proximal_weight}."
+        )
     sensitivity_tolerance = float(sensitivity_tolerance)
     if not 0.0 <= sensitivity_tolerance < 1.0:
         raise ValueError("sensitivity_tolerance must be in [0, 1).")
@@ -332,10 +430,9 @@ def optimize_transmission_expansion_iteratively(
     branch_components = [
         c for c in ("Line", "LineX") if c in n.components and not n.df(c).empty
     ]
-    # DC links carry no voltage law, so the iteration neither linearises nor
-    # boxes them - but they are part of the plan, and the solve that closes a
-    # run has to hold them as well as the AC capacities, see
-    # ``pin_capacities``
+    # DC links carry no voltage law, so the iteration does not linearise them
+    # - but they are part of the plan, and the solve that closes a run has to
+    # hold them as well as the AC capacities, see ``pin_capacities``
     link_ext_i = pd.Index([], name="Link")
     if "Link" in n.components and not n.links.empty:
         extendable = n.links.get("p_nom_extendable")
@@ -407,9 +504,7 @@ def optimize_transmission_expansion_iteratively(
             names.extend(
                 f"{c}-{nominal_attrs[c]}" for c in tracked_branch_components
             )
-        # the SSSC rating is the anchor of its own proximal term, so it has to
-        # be read back for the next iteration even where nothing is tracked
-        if (track_iterations or sssc_on) and "LineX" in branch_components:
+        if track_iterations and "LineX" in branch_components:
             names.append("LineX-sssc_nom")
         if not link_ext_i.empty:
             names.append("Link-p_nom")
@@ -450,7 +545,7 @@ def optimize_transmission_expansion_iteratively(
 
         sssc_nom = (
             m["LineX-sssc_nom"].solution.to_pandas()
-            if (track_iterations or sssc_on) and "LineX-sssc_nom" in m.variables
+            if track_iterations and "LineX-sssc_nom" in m.variables
             else None
         )
         link_caps = (
@@ -482,16 +577,11 @@ def optimize_transmission_expansion_iteratively(
     ext_branches = as_branch_index("ext_i")
     scaling_branches = as_branch_index("scaling_i")
 
-    # capacities the iteration starts from; they define both the floor of the
-    # impedance-defining capacity and the scale of the trust region
+    # capacities the iteration starts from; they define the floor of the
+    # impedance-defining capacity
     initial_caps = collect_branch_caps("s_nom").astype(float)
     capacity_floor = initial_caps.abs() * 1e-6
-    radius_scale = initial_caps.abs()
-    positive_scale = radius_scale[radius_scale > 0]
-    radius_scale = radius_scale.mask(
-        radius_scale <= 0,
-        float(positive_scale.mean()) if not positive_scale.empty else 1.0,
-    )
+
     def update_line_params(network: Network, s_nom_define: pd.Series) -> None:
         """
         Update branch impedance-defining parameters from the current F_def vector.
@@ -619,19 +709,80 @@ def optimize_transmission_expansion_iteratively(
                 columns={"mu": f"mu_{iteration}"}
             )
 
+    def displacement(current: np.ndarray, previous: np.ndarray, plan: pd.Series) -> float:
+        r"""
+        Share of the moved capital that is net displacement over the last two
+        steps.
+
+        .. math::
+            \eta_n = \frac{\sum_l c_l \,\bigl|\Delta^n_l + \Delta^{n-1}_l\bigr|}
+                           {\sum_l c_l \bigl(|\Delta^n_l| + |\Delta^{n-1}_l|\bigr)}
+
+        with :math:`\Delta^k = F^{k,*} - F^{k,\mathrm{fix}}` the movement the
+        plan actually made at iteration :math:`k`. One means every branch
+        walked in one direction, zero that every branch came back to where it
+        started: the iteration turned instead of moving.
+
+        **It reads direction and size together**, which is what neither of the
+        two obvious alternatives does. The size of the step alone cannot tell a
+        plan that is walking steadily from one that is stuck: measured on a
+        1250 bus case a healthy run holds ``step[n]/step[n-1]`` between 0.88
+        and 0.94 for twenty iterations while an orbit holds 0.99 to 1.02, so a
+        bar on the ratio has to thread a 1.5 % gap - and on the small meshed
+        system a perfectly healthy run twice takes a *longer* step than the one
+        before it while walking straight. The direction alone is no better,
+        because it ignores how far the plan went: a long step followed by a
+        short one in the opposite direction reverses the cosine to -0.11 while
+        the plan has plainly still moved, and at a fixed point, where the
+        remaining motion is numerical noise, the cosine is a random sign.
+        :math:`\eta` reads 0.88 and 1.00 on those same two iterates, because
+        the net displacement is dominated by the step that was long.
+
+        Two properties of the form matter. The modulus is taken **per branch**
+        before the sum, so a branch growing while another shrinks does not
+        cancel into a false reading of progress. And the capital cost weights
+        it, as it weights the step and the proximal term, so the many small
+        branches that swap between degenerate optima cannot outvote the plan.
+        """
+        weights = move_costs.to_numpy()
+        gross = float((weights * (np.abs(current) + np.abs(previous))).sum())
+        capital = float((move_costs * plan.loc[ext_branches].abs()).sum())
+        if gross <= PROXIMAL_STEP_FLOOR * max(capital, 1.0):
+            # nothing moved at all, which is the fixed point, not a turn
+            return 1.0
+        return float((weights * np.abs(current + previous)).sum() / gross)
+
     def relative_capacity_change(
         current: pd.Series, previous: pd.Series, initial: pd.Series
     ) -> float:
+        r"""
+        Size of the step, in the capital-cost weighted Euclidean norm.
+
+        .. math::
+            \mathrm{step} = \sqrt{\frac{\sum_l c_l (F_l - F'_l)^2}
+                                        {\sum_l c_l (F^0_l)^2}}
+
+        over the extendable branches. Weighting by the capital cost is what
+        makes the measure about the *plan* rather than about megawatts: an
+        expensive branch that keeps moving says the plan is not settled, while
+        the same movement on a cheap one barely changes it, and an unweighted
+        norm cannot tell the two apart. It is the same weight the proximal
+        term charges in, so the quantity the step control prices and the
+        quantity the convergence test reads are the same quantity.
+
+        The reference is the *initial* capacity vector, fixed for the run, so
+        the measure is a displacement relative to the system the run started
+        from rather than to whatever the current iterate happens to be.
+        """
         if ext_branches.empty:
             return 0.0
-        denom = np.linalg.norm(initial.loc[ext_branches].to_numpy())
-        denom = max(denom, 1e-12)
-        return float(
-            np.linalg.norm(
-                (current - previous).loc[ext_branches].to_numpy()
-            )
-            / denom
-        )
+        weights = move_costs.to_numpy()
+        reference = initial.loc[ext_branches].to_numpy()
+        denom = float(np.sqrt((weights * reference**2).sum()))
+        if denom <= 0.0:
+            denom = 1e-12
+        delta = (current - previous).loc[ext_branches].to_numpy()
+        return float(np.sqrt((weights * delta**2).sum()) / denom)
 
     # weights of the proximal term: moving a branch capacity is penalised in
     # units of the capital cost of that branch
@@ -646,119 +797,50 @@ def optimize_transmission_expansion_iteratively(
         fallback = float(weights.mean()) if weights.notna().any() else 1.0
         proximal_costs[c] = weights.fillna(fallback)
 
-    # ---------------------------------------------------------------- SSSC
-    # The same term on the series compensation. It needs no scale of its own:
-    # the term charges ``delta * c_l`` per MVAr moved and the anchor enters only
-    # the right-hand side of the deviation constraints, so the small positive
-    # allocations a crossover-free barrier leaves on the branches that carry
-    # nothing - measured 2e-7 MVAr against a smallest real allocation of about
-    # 1 MVAr - cost nothing and need no threshold to be told apart.
-    sssc_ext_i = pd.Index([], name="LineX")
-    if "LineX" in n.components and not n.line_xs.empty:
-        extendable = n.line_xs.get("sssc_nom_extendable")
-        if extendable is not None:
-            sssc_ext_i = n.line_xs.index[extendable.fillna(False).astype(bool)]
-    sssc_on = proximal_on and proximal_target in ("sssc", "both")
-    if sssc_on and sssc_ext_i.empty:
-        logger.warning(
-            "proximal_target=%r asks for a proximal term on the series "
-            "compensation, but no LineX has 'sssc_nom_extendable' set. The "
-            "term is skipped.",
-            proximal_target,
-        )
-        sssc_on = False
-    branches_on = proximal_on and proximal_target in ("branches", "both")
-
-    if sssc_on:
-        sssc_weights = (
-            n.line_xs["capital_cost_sssc"].reindex(sssc_ext_i).astype(float)
-        )
-        sssc_weights = sssc_weights.where(
-            np.isfinite(sssc_weights) & (sssc_weights > 0.0)
-        )
-        sssc_costs = sssc_weights.fillna(
-            float(sssc_weights.mean()) if sssc_weights.notna().any() else 1.0
-        )
-    else:
-        sssc_costs = pd.Series(dtype=float)
-    # cost of the capacity that is already installed, which the objective of
-    # every iteration carries along. It is frozen at the value of the first
-    # iteration, where the capacities still are the initial ones.
-    installed_cost = [0.0]
-
+    # capital cost of each extendable branch, aligned on ``ext_branches``.
+    # Both the proximal term and the step measure are weighted with it: what
+    # matters about a step is the capital it moves, not the megawatts.
     move_costs = (
         pd.concat(proximal_costs, names=["component", "name"]).reindex(ext_branches)
         if branch_components
         else pd.Series(dtype=float)
     )
 
-    def sssc_move(sssc: pd.Series | None, center: pd.Series | None) -> float:
-        """Size of the SSSC part of a step, in the metric the term charges."""
-        if not sssc_on or sssc is None or center is None:
-            return 0.0
-        distance = (
-            sssc.reindex(sssc_ext_i).astype(float)
-            - center.reindex(sssc_ext_i).astype(float)
-        ).abs()
-        return float((sssc_costs * distance).sum())
+    # cost of the capacity that is already installed, which the objective of
+    # every iteration carries along. It is frozen at the value of the first
+    # iteration, where the capacities still are the initial ones.
+    installed_cost = [0.0]
 
-    def proximal_move(caps: pd.Series, center: pd.Series) -> float:
+    def proximal_term_value(caps: pd.Series, center: pd.Series) -> float:
         """
-        Size of a step in the metric the proximal term charges for, i.e. the
-        capital cost of the capacity it moved.
+        Value of the proximal expression, without its outer weight.
         """
-        moved = 0.0
-        for c in branch_components if branches_on else ():
+        value = 0.0
+        for c in branch_components:
             ext_i = branch_data[c]["ext_i"]
             if ext_i.empty:
                 continue
-            distance = (
-                caps.xs(c, level="component").reindex(ext_i)
-                - center.xs(c, level="component").reindex(ext_i)
-            ).abs()
-            moved += float((proximal_costs[c] * distance).sum())
-        return moved
+            anchor = center.xs(c, level="component").reindex(ext_i)
+            current = caps.xs(c, level="component").reindex(ext_i)
+            value += float(
+                (proximal_costs[c] * (current - anchor) ** 2 / anchor).sum()
+            )
+        return value
 
     def add_proximal_penalty(
         network: Network,
         center: pd.Series,
         weight: float,
-        sssc_center: pd.Series | None = None,
     ) -> None:
         """
         Penalise moving the branch capacities away from the previous iterate.
 
-        The absolute value is modelled with a non-negative deviation variable
-        ``d_l >= |F_l - F_l'|``, which the penalty drives onto the bound, so the
-        model stays a linear program.
+        A scaled free deviation variable per branch keeps every diagonal
+        quadratic coefficient identical and leaves the branch-specific scaling
+        in linear defining equalities, which is kinder to the solver than
+        writing the branch weights into the quadratic objective directly.
         """
         m = network.model
-        if sssc_on and sssc_center is not None and "LineX-sssc_nom" in m.variables:
-            rating = m["LineX-sssc_nom"]
-            # ``intersection`` drops the index name, which linopy needs as the
-            # dimension name of the deviation variable
-            index = (
-                pd.Index(rating.indexes[rating.dims[0]])
-                .intersection(sssc_ext_i)
-                .rename(rating.dims[0])
-            )
-            if not index.empty:
-                cost = sssc_costs.reindex(index)
-                anchor = sssc_center.reindex(index).astype(float)
-                deviation = m.add_variables(
-                    lower=0, coords=[index], name="LineX-sssc_nom_deviation"
-                )
-                m.add_constraints(
-                    deviation - rating >= -anchor,
-                    name="LineX-sssc_nom_deviation-upper",
-                )
-                m.add_constraints(
-                    deviation + rating >= anchor,
-                    name="LineX-sssc_nom_deviation-lower",
-                )
-                m.objective = m.objective + (deviation * (weight * cost)).sum()
-        if center is None or not branches_on:
-            return
         for c in branch_components:
             ext_i = branch_data[c]["ext_i"]
             attr = nominal_attrs[c]
@@ -766,28 +848,31 @@ def optimize_transmission_expansion_iteratively(
                 continue
             capacity = m[f"{c}-{attr}"]
             anchor = center.xs(c, level="component").reindex(ext_i)
+            if not np.isfinite(anchor).all() or (anchor <= 0.0).any():
+                raise ValueError(
+                    "The proximal term requires strictly positive finite "
+                    "previous branch capacities, since it scales by them."
+                )
+            scale = np.sqrt(weight * proximal_costs[c] / anchor)
             deviation = m.add_variables(
-                lower=0, coords=[ext_i], name=f"{c}-{attr}_deviation"
+                lower=-np.inf,
+                upper=np.inf,
+                coords=[ext_i],
+                name=f"{c}-{attr}_deviation",
             )
             m.add_constraints(
-                deviation - capacity >= -anchor, name=f"{c}-{attr}_deviation-upper"
+                deviation - capacity * scale == -anchor * scale,
+                name=f"{c}-{attr}_deviation-definition",
             )
-            m.add_constraints(
-                deviation + capacity >= anchor, name=f"{c}-{attr}_deviation-lower"
-            )
-            m.objective = m.objective + (
-                deviation * (weight * proximal_costs[c])
-            ).sum()
+            m.objective = m.objective + (deviation * deviation).sum()
 
     def extra_functionality_for(
         center: pd.Series | None,
         weight: float,
-        sssc_center: pd.Series | None = None,
     ) -> Any:
         def extra_functionality(network: Network, sns: pd.Index) -> None:
-            anchored = center is not None or sssc_center is not None
-            if weight > 0.0 and anchored:
-                add_proximal_penalty(network, center, weight, sssc_center)
+            if weight > 0.0 and center is not None:
+                add_proximal_penalty(network, center, weight)
             if user_extra_functionality is not None:
                 user_extra_functionality(network, sns)
 
@@ -798,8 +883,6 @@ def optimize_transmission_expansion_iteratively(
         caps: pd.Series,
         center: pd.Series | None,
         weight: float,
-        sssc: pd.Series | None = None,
-        sssc_center: pd.Series | None = None,
     ) -> float:
         """
         System cost of the solution just obtained, i.e. the cost of the
@@ -824,24 +907,25 @@ def optimize_transmission_expansion_iteratively(
             if getattr(network, "_objective_constant_missing_from_expression", False):
                 value += float(getattr(network, "objective_constant", 0.0))
         value = float(value)
-        if weight > 0.0 and center is not None and branches_on:
-            value -= weight * proximal_move(caps, center)
-        if weight > 0.0 and sssc_center is not None:
-            value -= weight * sssc_move(sssc, sssc_center)
+        if weight > 0.0 and center is not None:
+            value -= weight * proximal_term_value(caps, center)
         return value - installed_cost[0]
 
-    def cost_converged(history: list[float], cost: float) -> bool:
+    def has_settled(history: list[float], cost: float, step: float) -> bool:
         """
-        The system cost has to be stationary over ``cost_window`` iterations.
+        Both convergence tests, on the same iterate.
+
+        The cost has to have stopped changing *and* the plan has to have
+        stopped moving. Either alone is met by a run that has not converged:
+        the cost is stationary along the directions a limit cycle turns in,
+        and a small step can be produced by damping rather than by
+        stationarity.
         """
-        if len(history) < cost_window:
+        if not history:
             return False
-        window = [*history[-cost_window:], cost]
-        reference = max(abs(window[-1]), 1e-12)
-        return all(
-            abs(window[i + 1] - window[i]) / reference <= cost_threshold
-            for i in range(cost_window)
-        )
+        if abs(cost - history[-1]) / max(abs(cost), 1e-12) > cost_threshold:
+            return False
+        return step_threshold <= 0.0 or step <= step_threshold
 
     def branch_flow(network: Network, c: str, index: pd.Index) -> pd.DataFrame:
         """
@@ -1016,120 +1100,6 @@ def optimize_transmission_expansion_iteratively(
 
         return sensitivity
 
-    def trust_region_widths(
-        center: pd.Series, radius: float
-    ) -> tuple[pd.Series, pd.Series]:
-        """
-        Half widths ``(down, up)`` of the trust region per branch.
-
-        The radius is relative to the capacity of the linearisation point, so
-        that the region stays meaningful once the capacities have grown well
-        beyond their initial value, and is floored by the initial capacity, so
-        that it does not collapse for branches shrinking towards zero.
-
-        The region is not symmetric. Both parts of a branch term of the voltage
-        law scale with the inverse capacity, so in the relative deviation
-        ``u = F / F_def - 1`` of ``define_relative_capacity_deviation`` the
-        exact term is ``T / (1 + u)`` while the linearisation carried by the
-        constraint is ``T (1 - u)``, leaving the error
-
-        .. math::
-            e(u) = T \\, \\frac{u^2}{1 + u}.
-
-        That error is even in neither direction: it stays second order while
-        the capacity grows but diverges as the capacity collapses, so a
-        symmetric box tolerates a much larger error below the linearisation
-        point than above it - three times as much at ``radius = 0.5`` and an
-        unbounded amount from ``radius = 1`` on, where the symmetric region
-        reaches a vanishing capacity.
-        Widening upwards by ``radius`` and downwards by ``radius / (1 + radius)``
-        instead makes the region geometrically symmetric,
-
-        .. math::
-            \\bar{F} / (1 + \\rho) \\;\\le\\; F \\;\\le\\; \\bar{F} (1 + \\rho),
-
-        which is the natural symmetry of a term proportional to ``1 / F`` and
-        equalises the error exactly: both ends leave ``e = T \\rho^2 / (1 + \\rho)``.
-        """
-        scale = np.maximum(center.abs(), radius_scale)
-        return radius / (1.0 + radius) * scale, radius * scale
-
-    def trust_region_binding(
-        current: pd.Series, previous: pd.Series, radius: float
-    ) -> bool:
-        """
-        Whether the trust region restricts the step.
-
-        Measured as the share of the moved capital cost that sits at the
-        boundary of the region. In the maximum norm a single small branch
-        swinging between degenerate optima already fills its own width and
-        would report a restriction that does not exist, so the branches at the
-        boundary are weighted with the cost of the capacity they move.
-        """
-        if ext_branches.empty:
-            return False
-        delta = (current - previous).loc[ext_branches]
-        down, up = trust_region_widths(previous, radius)
-        # the region is asymmetric, so a branch is measured against the half
-        # width on the side it actually moved to
-        widths = up.loc[ext_branches].where(delta >= 0, down.loc[ext_branches])
-        change = delta.abs()
-        at_boundary = (change / widths.clip(lower=1e-12)) >= 0.9
-        moved = move_costs * change
-        total = float(moved.sum())
-        if total <= 0.0:
-            return False
-        return float(moved[at_boundary].sum()) / total >= 0.1
-
-    def step_alignment(current: pd.Series, previous: pd.Series) -> float:
-        """
-        Cosine between the fixed-point residuals of two consecutive steps.
-
-        The residual ``r = G(z) - z`` is the move the linear model asks for
-        from the point it was linearised at. A value near ``+1`` means the
-        iteration keeps walking in the same direction and is making progress; a
-        value near ``-1`` means the step undoes the one before it, which is the
-        signature of an oscillation: the branch capacity and the impedance it
-        sets move against each other, so the underlying fixed-point map is
-        reflecting rather than contracting. The box does not damp that on its
-        own - it is geometrically symmetric, so a branch that jumps to one wall
-        finds the other wall exactly back at its previous capacity, and the
-        orbit reproduces itself for as long as the radius is held. Only a
-        smaller radius shrinks it.
-
-        The directions are weighted with the cost of the capacity they move,
-        for the same reason ``trust_region_binding`` is: a swarm of tiny cheap
-        branches swinging between degenerate optima would otherwise decide the
-        angle.
-
-        """
-        if ext_branches.empty:
-            return 0.0
-        a = (move_costs * current.loc[ext_branches]).to_numpy()
-        b = (move_costs * previous.loc[ext_branches]).to_numpy()
-        na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
-        if na <= 0.0 or nb <= 0.0:
-            return 0.0
-        return float(a @ b / (na * nb))
-
-    def set_trust_region(network: Network, center: pd.Series, radius: float) -> None:
-        down, up = trust_region_widths(center, radius)
-        for c in branch_components:
-            ext_i = branch_data[c]["ext_i"]
-            if ext_i.empty:
-                continue
-            attr = nominal_attrs[c]
-            lower, upper = original_nominal_bounds[c]
-            middle = center.xs(c, level="component").reindex(ext_i)
-            delta_down = down.xs(c, level="component").reindex(ext_i)
-            delta_up = up.xs(c, level="component").reindex(ext_i)
-            network.df(c).loc[ext_i, f"{attr}_min"] = np.maximum(
-                lower.reindex(ext_i), middle - delta_down
-            )
-            network.df(c).loc[ext_i, f"{attr}_max"] = np.minimum(
-                upper.reindex(ext_i), middle + delta_up
-            )
-
     link_bounds: dict[str, pd.Series] = {}
 
     def unpin_links(network: Network) -> None:
@@ -1151,21 +1121,15 @@ def optimize_transmission_expansion_iteratively(
         computed at and buy an objective the network cannot deliver. On a
         converged run the difference is small, since the iteration has stopped
         moving, but it is the same distinction, and pinning is what makes the
-        two exits report the same quantity. Measured on
-        ``test_tr_4_3GVAsssc``, on a run that did not converge, an
-        unrestricted report solve returned a plan 4.1 % (capital cost weighted)
-        away from its linearisation point, with a residual of the exact voltage
-        law of 1.0e-2 against the 2.7e-4 of the iterate it replaced, and an
-        objective 0.33 % below every iterate of the run.
+        two exits report the same quantity.
 
         The DC links are held too, at the capacities of the same solve. They
         carry no voltage law and so never enter the iteration's own controls,
-        but they are transmission capacity all the same and on the network
-        above they expand from 21 to 553 GW: re-optimised at fixed AC
-        capacities they make the report a different plan rather than the price
-        of this one. Everything that is not capacity - the series compensation,
-        the dispatch, the storage - is left free, which is what makes this the
-        cost *of* the plan.
+        but they are transmission capacity all the same: re-optimised at fixed
+        AC capacities they make the report a different plan rather than the
+        price of this one. Everything that is not capacity - the series
+        compensation, the dispatch, the storage - is left free, which is what
+        makes this the cost *of* the plan.
         """
         if links is not None and not link_ext_i.empty:
             link_bounds["p_nom_min"] = network.links["p_nom_min"].copy()
@@ -1190,7 +1154,8 @@ def optimize_transmission_expansion_iteratively(
             network.df(c).loc[ext_i, f"{attr}_min"] = fixed
             network.df(c).loc[ext_i, f"{attr}_max"] = fixed
 
-    def reset_trust_region(network: Network) -> None:
+    def restore_nominal_bounds(network: Network) -> None:
+        """Restore the capacity bounds ``pin_capacities`` replaced."""
         for c in branch_components:
             attr = nominal_attrs[c]
             lower, upper = original_nominal_bounds[c]
@@ -1211,48 +1176,20 @@ def optimize_transmission_expansion_iteratively(
         )
         for c in branch_components
     }
-    radius_min, radius_max = (float(b) for b in trust_region_bounds)
-    shrink, expand = (float(f) for f in trust_region_factors)
-    tighten_cosine, relax_cosine = (float(a) for a in trust_region_alignment)
-    if not 0.0 < radius_min <= radius_max:
-        raise ValueError("trust_region_bounds must satisfy 0 < lower <= upper.")
-    if not -1.0 <= tighten_cosine <= relax_cosine <= 1.0:
-        raise ValueError(
-            "trust_region_alignment must satisfy -1 <= tighten <= relax <= 1."
-        )
-    if not 0.0 < shrink <= 1.0 <= expand:
-        raise ValueError(
-            "trust_region_factors must satisfy 0 < shrink <= 1 <= expand."
-        )
-    radius = float(np.clip(trust_region_initial, radius_min, radius_max))
-    linearised = scheme == "slp"
-
     current_def = initial_caps.copy()
     cost_history: list[float] = []
     proximal_delta = proximal_weight if proximal_on else 0.0
-
-    def tighten() -> None:
-        """
-        Shrink the trust region, i.e. restrict the step the linear model is
-        trusted over. The weight of the proximal term is not touched: it is
-        fixed for the whole run, see ``PROXIMAL_WEIGHT``.
-        """
-        nonlocal radius
-        radius = max(radius * shrink, radius_min)
-
-    def relax() -> None:
-        """Widen the trust region again."""
-        nonlocal radius
-        radius = min(radius * expand, radius_max)
+    # Step vector of the previous accepted iterate, which is what
+    # ``proximal_adaptive`` measures the displacement against.
+    previous_step_vector: np.ndarray | None = None
+    # A doubling changes the penalty regime. Keep the following iterate as a
+    # cooldown step, so its low progress cannot immediately trigger another
+    # doubling.
+    proximal_raised_previous_iteration = False
 
     reference_terms: pd.DataFrame | None = None
-    # anchor of the SSSC proximal term, carried like ``current_def`` is for the
-    # capacities. It is the solved rating, not a linearisation point, so it is
-    # never damped or clipped.
-    current_sssc: pd.Series | None = None
     # last solved DC link capacities, held by the report solve alongside the AC
     current_links: pd.Series | None = None
-    previous_residual: pd.Series | None = None
     plain_step = False
     has_converged = False
     iteration = 1
@@ -1285,56 +1222,39 @@ def optimize_transmission_expansion_iteratively(
 
             update_line_params(n, current_def)
 
-            # linearise the KVL constraint in the branch capacities and restrict
-            # them to the trust region around the linearisation point
+            # linearise the KVL constraint in the branch capacities around the
+            # linearisation point
             sensitivity = None
             if linearised and reference_terms is not None and not plain_step:
                 sensitivity = capacity_sensitivity(reference_terms, current_def)
             # a fallback step onto the plain fixed point is taken on its own,
-            # with neither the linearisation nor the box that made the previous
-            # attempt infeasible
-            plain_step_now = plain_step
+            # without the linearisation that made the previous attempt
+            # infeasible
             plain_step = False
             n._kvl_capacity_sensitivity = sensitivity
-            # the box needs a previous iterate to be centred on, not a
-            # linearisation, so it applies under either scheme
-            boxed = (
-                not plain_step_now
-                and (sensitivity is not None or iteration > 1)
-            )
-            if boxed:
-                set_trust_region(n, current_def, radius)
-            else:
-                reset_trust_region(n)
 
             # anchor of the proximal term, absent in the first iteration where
             # no previous iterate exists
             anchor = current_def if iteration > 1 else None
-            sssc_anchor = current_sssc if iteration > 1 else None
             weight = proximal_delta if anchor is not None else 0.0
             status, condition = solve_once(
                 snapshots,
                 lightweight=True,
-                extra_functionality=extra_functionality_for(
-                    anchor, weight, sssc_anchor
-                ),
+                extra_functionality=extra_functionality_for(anchor, weight),
             )
             if status != "ok":
                 if sensitivity is not None:
                     # the linearised problem can be infeasible where the frozen
-                    # impedances require more capacity than the trust region
-                    # admits. Fall back to an unrestricted fixed-point step,
-                    # which is always feasible, and be more careful afterwards.
-                    tighten()
+                    # impedances require more capacity than the linearised
+                    # voltage law admits. Fall back to a plain fixed-point
+                    # step, which is always feasible.
                     plain_step = True
                     logger.warning(
                         "Iteration %d failed with status %s/%s, falling back to a "
-                        "fixed-point step and restricting the next one "
-                        "(radius %.3e).",
+                        "fixed-point step.",
                         iteration,
                         status,
                         condition,
-                        radius,
                     )
                     records.append(
                         {
@@ -1345,8 +1265,7 @@ def optimize_transmission_expansion_iteratively(
                             "step": np.nan,
                             "violation": np.nan,
                             "violation_rel": np.nan,
-                            "radius": radius,
-                            "binding": False,
+                            "progress": np.nan,
                             "proximal": np.nan,
                             "accepted": False,
                         }
@@ -1379,7 +1298,6 @@ def optimize_transmission_expansion_iteratively(
                 )
                 if sensitivity is not None:
                     # such a solution must not become the linearisation point
-                    tighten()
                     plain_step = True
                     records.append(
                         {
@@ -1390,8 +1308,7 @@ def optimize_transmission_expansion_iteratively(
                             "step": np.nan,
                             "violation": np.nan,
                             "violation_rel": np.nan,
-                            "radius": radius,
-                            "binding": False,
+                            "progress": np.nan,
                             "proximal": np.nan,
                             "accepted": False,
                         }
@@ -1402,12 +1319,9 @@ def optimize_transmission_expansion_iteratively(
 
             if iteration == 1:
                 installed_cost[0] = float(getattr(n, "objective_constant", 0.0))
-            solved_sssc = (
-                None if iteration_result is None else iteration_result.sssc_nom
-            )
             if iteration_result is not None and iteration_result.link_caps is not None:
                 current_links = iteration_result.link_caps
-            cost = solved_cost(n, caps, anchor, weight, solved_sssc, sssc_anchor)
+            cost = solved_cost(n, caps, anchor, weight)
             diff = relative_capacity_change(caps, current_def, initial_caps)
 
             if track_iterations:
@@ -1436,56 +1350,44 @@ def optimize_transmission_expansion_iteratively(
             # once that decision (converged / superseded) is known.
 
             # the linear model predicted a vanishing residual, so the residual
-            # left over is the error the trust region has to control. It only
-            # steers the width of the next step: a solved iterate is never
-            # discarded, and at a converged point the linearisation reproduces
-            # its own point, where the constraint coincides with the exact one.
-            binding = boxed and trust_region_binding(caps, current_def, radius)
-            # A step held by the box is not a converged one, however little the
-            # cost moved: the size of the step is proportional to the radius, so
-            # a narrow enough region satisfies any tolerance on the cost while
-            # the iterate is still being dragged. Measured on a case where the
-            # region bound on every iteration, the four settings of
-            # ``trust_region_alignment`` all stopped on the boundary and, at
-            # matched residual, the ones that had shrunk the radius fastest
-            # returned the most expensive plan - up to 0.05 % over the slowest -
-            # because the plan is a prisoner of the path the box allowed. The
-            # region has to let go before the point counts as one the iteration
-            # chose rather than one it was held at. It does let go on its own:
-            # ``binding`` is the share of the moved capital sitting at the
-            # boundary, which falls as the step shrinks against a fixed radius,
-            # and the relax branch below widens the region while the steps stay
-            # aligned.
+            # left over is the error of the model that was solved. Every solved
+            # iterate is accepted however large that residual is: at a converged
+            # point the linearisation reproduces its own point, where the
+            # constraint coincides with the exact one.
+
             converged = (
-                cost_converged(cost_history, cost)
+                has_settled(cost_history, cost, diff)
                 and iteration >= min_iterations
-                and not binding
             )
-            residual = caps - current_def
-            alignment = (
-                np.nan
-                if previous_residual is None
-                else step_alignment(residual, previous_residual)
+            step_vector = (caps - current_def).loc[ext_branches].to_numpy()
+            progress = (
+                displacement(step_vector, previous_step_vector, caps)
+                if previous_step_vector is not None
+                else float("nan")
             )
-            # every solved iterate is kept; the controls only set how far the
-            # model is trusted over the *next* step
-            # only the radius is adapted, so there is nothing to decide where
-            # the box is off
-            # the first step has no previous direction to be compared with, so
-            # there is no evidence to move the radius on
-            controlled = not converged and alignment == alignment
-            if controlled and alignment <= tighten_cosine:
-                # the step undid the one before it. Nothing else the iteration
-                # measures sees this: the residual of the voltage law is small
-                # on an orbit, and the size of the step is flat rather than
-                # growing, so a criterion on either only fires by accident.
-                # The radius is the one control that shrinks the orbit, since
-                # the orbit lives on the walls of the box.
-                tighten()
-            elif controlled and alignment >= relax_cosine and binding:
-                # the iteration keeps walking the same way and the box is what
-                # holds it back
-                relax()
+            # A window whose capital was mostly moved back is a turning step.
+            # Shorten the *next* step immediately, unless the preceding
+            # iteration already raised the weight: that one-iteration cooldown
+            # lets the new penalty take effect before it is judged again.
+            can_raise_proximal = (
+                proximal_on
+                and proximal_adaptive
+                and not converged
+                and not proximal_raised_previous_iteration
+                and np.isfinite(progress)
+                and progress < PROXIMAL_TURN_BAR
+            )
+            if can_raise_proximal:
+                previous_proximal_delta = proximal_delta
+                proximal_delta = min(
+                    proximal_delta * PROXIMAL_ADAPTIVE_FACTOR, proximal_ceiling
+                )
+                proximal_raised_previous_iteration = (
+                    proximal_delta > previous_proximal_delta
+                )
+            else:
+                proximal_raised_previous_iteration = False
+            previous_step_vector = step_vector
 
             cost_change = (
                 abs(cost - cost_history[-1]) / max(abs(cost), 1e-12)
@@ -1507,16 +1409,10 @@ def optimize_transmission_expansion_iteratively(
                 diff,
                 violation_rel,
                 ""
-                if not (boxed or proximal_on)
+                if not proximal_on
                 else (
-                    (f", radius = {radius:.3e}" if boxed else "")
-                    + (
-                        f", alignment = {alignment:+.3f}"
-                        if alignment == alignment
-                        else ""
-                    )
-                    + (f", proximal = {proximal_delta:.3e}" if proximal_on else "")
-                    + (", binding" if binding else "")
+                    f", progress = {progress:.3f}, proximal = {weight:.3e}"
+                    + (f" -> {proximal_delta:.3e}" if proximal_adaptive else "")
                 ),
             )
             records.append(
@@ -1528,33 +1424,23 @@ def optimize_transmission_expansion_iteratively(
                     "step": diff,
                     "violation": violation,
                     "violation_rel": violation_rel,
-                    "radius": radius if boxed else np.nan,
-                    "alignment": alignment,
-                    "binding": binding,
+                    "progress": progress,
                     "proximal": weight,
                     "accepted": True,
                 }
             )
 
             if converged:
+                has_converged = True
                 current_def = clip_branch_caps(
                     caps.copy(), branch_cap_min, branch_cap_max
                 )
-                # linearise the final solve at the converged point, where the
-                # linearisation is exact
-                reference_terms = cycle_terms
                 cost_history.append(cost)
-                has_converged = True
-                # The report solve below closes every run, so this iterate's
-                # model is released like any other rather than completed in
-                # place: it is solved once more at the same capacities, with
-                # them pinned there.
+                # the report solve below closes this run as it closes any
+                # other, so this iterate's model is released like the rest
                 discard_model(n)
                 break
 
-            previous_residual = residual
-            if solved_sssc is not None:
-                current_sssc = solved_sssc.clip(lower=0.0)
             cost_history.append(cost)
             if linearised:
                 current_def = clip_branch_caps(
@@ -1571,10 +1457,9 @@ def optimize_transmission_expansion_iteratively(
             discard_model(n)
             iteration += 1
     finally:
-        # never leave the linearisation or the trust region on the network, not
-        # even when the loop is left through an exception
+        # never leave the linearisation on the network, not even when the loop
+        # is left through an exception
         n._kvl_capacity_sensitivity = None
-        reset_trust_region(n)
         n.iteration_log = pd.DataFrame(
             records,
             columns=[
@@ -1585,9 +1470,7 @@ def optimize_transmission_expansion_iteratively(
                 "step",
                 "violation",
                 "violation_rel",
-                "radius",
-                "alignment",
-                "binding",
+                "progress",
                 "proximal",
                 "accepted",
             ],
@@ -1600,10 +1483,14 @@ def optimize_transmission_expansion_iteratively(
         del n.model
         gc.collect()
 
-    # Every run is closed by this solve, converged or not: the iterates are
+    # Every run is closed by this solve, converged or not. The iterates are
     # solved lightweight and their models discarded, so no solved iterate is
-    # left to read a full result from. Solve once more at the capacities of the
-    # last iterate to obtain a fully populated network.
+    # left to read a full result from; and an iterate's dispatch comes from the
+    # *linearised* voltage law with the proximal penalty still in its
+    # objective, which is a step of the iteration rather than a plan priced at
+    # its own impedances. Solve once more with the transmission capacities
+    # pinned at the last iterate and the impedances put on them, leaving
+    # everything that is not transmission capacity free.
     logger.info(
         "Preparing final solve with updated transmission parameters at the "
         "capacities of the %s iterate.",
@@ -1625,14 +1512,13 @@ def optimize_transmission_expansion_iteratively(
             # No penalty: this solve is not a step of the iteration but the
             # report of one, so it has to return the true system cost at the
             # last accepted capacities. The capacities are pinned, so the
-            # proximal term would only add a constant, but the trust region
-            # and the penalty are both step controls and neither belongs in a
-            # solve that takes no step.
+            # proximal term would only add a constant, and a step control does
+            # not belong in a solve that takes no step.
             extra_functionality=extra_functionality_for(None, 0.0),
         )
     finally:
         n._kvl_capacity_sensitivity = None
-        reset_trust_region(n)
+        restore_nominal_bounds(n)
         unpin_links(n)
 
     if status == "ok":

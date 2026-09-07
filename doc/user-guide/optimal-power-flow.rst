@@ -642,51 +642,66 @@ Two schemes are available through the ``scheme`` argument:
     capacity of the previous iterate. This is the plain fixed-point iteration
     of Hagspiel et al. (2014).
 
-A linearisation is only valid over a limited step, and two step controls bound
-it. They are independent of each other and of the scheme; the trust region
-radius is adapted during the iteration, the proximal weight is not:
+The SLP linearisation is only valid over a limited step, so from the second
+iteration onward it is damped by a proximal penalty on the extendable ``Line``
+and ``LineX`` capacities: a scaled squared distance from the previous iterate,
+weighted by the capital cost of each branch. The gradient of that penalty
+vanishes at the anchor, so a fixed point of the damped step is a fixed point of
+the undamped problem and the converged plan does not depend on the weight the
+run needed to reach it.
 
-``proximal="l2"`` (default)
-    Adds a penalty on moving a branch capacity away from the previous iterate,
-    in units of that branch's capital cost. Its weight ``proximal_weight``
-    defaults to 0.5 for ``"l2"`` and 1e-3 for ``"l1"`` and is fixed for the
-    whole run.
-    A lighter weight reaches the same plan in fewer iterations wherever the run
-    converges, and costs margin on instances whose brownfield capacity is small
-    against the expansion the optimum wants; raise it towards 0.5 on a run that
-    does not converge.
-    It also resolves the degeneracy that lets equal-cost plans
-    exchange capacity between branches. ``"l2"`` keeps the objective's optimality
-    conditions exact at the anchor at the price of a quadratic inner problem;
-    ``"l1"`` keeps the inner problem linear but has a dead zone, so its weight is
-    capped an order of magnitude lower and it cannot serve as the only control.
+``proximal`` (default ``True``) switches the term on and off, and
+``proximal_weight`` (default ``1.0``) sets its weight. Each system has a
+stability boundary below which the iteration turns in a limit cycle instead of
+contracting, so a run that oscillates wants a larger weight. Under
+``scheme="fixed_point"`` the term is inactive: that scheme freezes rather than
+linearises the voltage law and leaves no linearisation error to control.
 
-``trust_region=True`` (off by default)
-    Restricts the capacities of each inner problem to a box around the previous
-    iterate, whose radius is adapted to the observed linearisation error. It
-    narrows the next step rather than discarding the one just solved: a solved
-    iterate is always kept. It is the only control that bounds the step *hard*,
-    which is why it is the safeguard to reach for when a run oscillates or
-    diverges, and it is what makes ``proximal="l1"`` usable at all. It is off by
-    default because next to ``"l2"`` it has not been measured to earn its cost:
-    on the meshed test system and on SciGrid Germany it never improved the plan
-    and cost 6-15 % more iterations, and where it does bind it throttles a
-    branch that has to grow by orders of magnitude just as it throttles one
-    oscillating between equal-cost plans.
+``proximal_adaptive`` (default ``True``) makes the run find that weight for
+itself: whenever the relative KVL residual of an accepted iterate exceeds the
+one before it, the weight is doubled, up to ``proximal_ceiling`` (default
+``4``). The residual is the error of the linear model the step was solved on,
+so a rise is direct evidence that the step went past where the linearisation
+holds. The weight is never released again, which is safe because a fixed point
+of the penalised step is a fixed point of the unpenalised problem: too heavy a
+weight costs iterations, not accuracy. ``proximal_weight`` is therefore the
+*initial* weight.
+
+It is the default because a weight below a system's stability boundary fails
+*silently*: the run reports itself converged on a plan that is still moving,
+and the reported cost is lower than the plan can deliver. Measured on a 1250
+bus case, the default weight held fixed stops on a period-2 orbit at iteration
+16 with a relative KVL residual of 1.6e-4, while the rule from the same start
+converges at iteration 18 with 8.7e-7 - and reaches it five iterations sooner
+than the best fixed weight for that system.
+
+Set ``proximal_adaptive=False`` where a fixed weight is known to work. The rule
+is driven by a comparison, not by a level, so once the residual reaches the
+floor set by the solver tolerance every wobble upward reads as a rise and the
+weight climbs on a run that was already converging; the ceiling is what bounds
+that, and the cost is over-damping rather than a wrong answer.
 
 Both schemes stop once the **system cost** has changed by less than
 ``cost_threshold`` (default ``1e-5``) in each of the last ``cost_window``
-(default ``1``) iterations. The relative change of the transmission capacities,
+(default ``2``) iterations. The relative change of the transmission capacities,
 which earlier versions used as criterion, is only reported as a diagnostic: it
 is a step size rather than a measure of convergence, and on meshed networks
 degenerate alternative optima keep it bouncing long after the solution has
 settled, while a small step can occur by accident.
 
+A converged run is reported from the iterate it converged on. At that point the
+linearisation is exact, so the model that iterate solved is the exact problem
+at the point it returned; its solve is completed in place, which is what
+carries the duals and the derived time series. A run that exhausts
+``max_iterations`` is closed instead by a report solve at the capacities of its
+last iterate, pinned there, so that it costs that plan rather than looking for
+another one.
+
 The convergence history is written to ``n.iteration_log``, which reports per
-iteration the system cost and its relative change, the relative change of the
-transmission capacities, the residual of the exact voltage law, the trust region
-radius and whether it was binding (both empty unless ``trust_region=True``), the
-weight of the proximal term, and whether the step was accepted.
+iteration the solver status, the system cost and its relative change, the
+relative change of the transmission capacities, the residual of the exact
+voltage law in absolute and relative form, the weight of the proximal term, and
+whether the step was accepted.
 
 
 Security-Constrained Power Flow
