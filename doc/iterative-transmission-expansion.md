@@ -62,7 +62,7 @@ iteration exists for the voltage law alone.
 | $c_\ell$ | `capital_cost` | annualised capacity cost of branch $\ell$ (1a) |
 | $F^{\min}_\ell, F^{\max}_\ell$ | `s_nom_min`, `s_nom_max` | capacity bounds as given by the user (1f) |
 | $\varepsilon$ | `cost_threshold` | convergence tolerance, here on the system cost rather than on the capacities as in Algorithm 1 |
-| $\delta$ | `proximal_weight` | weight of the proximal term, constant over the run |
+| $\delta$ | `proximal_weight` | weight of the proximal term; the initial weight where `proximal_adaptive` raises it |
 | $\tau$ | `sensitivity_tolerance` | loading below which a branch sensitivity is dropped |
 
 ### Iteration quantities
@@ -79,7 +79,7 @@ iteration exists for the voltage law alone.
 | $g^{n,\mathrm{fix}}_{\ell,t} / F^{n,\mathrm{fix}}_\ell$ | `_kvl_capacity_sensitivity` | the derivative itself, truncated by $\tau$; the constraint multiplies it back by $F^{n,\mathrm{fix}}_\ell$ |
 | $u_\ell$ | `{Line,LineX}-s_nom_relative` | relative deviation of the capacity from the linearisation point |
 | $V^n, \hat{V}^n$ | `violation`, `violation_rel` | absolute and relative residual of the exact KVL |
-| $\mathrm{step}^n$ | `step` | capital-cost weighted relative capacity change |
+| $\mathrm{step}^n$ | `step` | relative capacity change |
 | $obj^n$ | `cost` | system cost of the iterate |
 
 ---
@@ -391,17 +391,33 @@ variables and equalities again.
 
 ### 6.2 Raising the weight during the run (`proximal_adaptive`)
 
-With `proximal_adaptive` the weight is not a constant: whenever the relative
-KVL residual of an accepted iterate exceeds that of the iterate before it,
+With `proximal_adaptive` the weight is not a constant: whenever an accepted
+iterate reports that most of the capital its own step and the step before it
+moved was moved back again,
 
-$$\hat{V}^n > \hat{V}^{n-1} \quad\Longrightarrow\quad
+$$p^n < \bar{p} \quad\text{and}\quad \delta^n = \delta^{n-1}
+\quad\Longrightarrow\quad
 \delta \leftarrow \min\!\left(2\delta,\ \delta_{\max}\right),$$
 
-with $\delta_{\max} =$ `proximal_ceiling`. The residual is the error of the
-linear model the step was solved on, so a rise is direct evidence that the step
-went past where the linearisation holds — the one quantity that says so without
-needing a scale, being measured against the voltage drop the branches produce
-at their rated capacity. `proximal_weight` is then the *initial* weight.
+with $\delta_{\max} =$ `proximal_ceiling` and $\bar{p} =$ `PROXIMAL_TURN_BAR`
+$= 0.65$. Here $p^n$ is `progress` in `n.iteration_log`, the share of the
+capital moved over the last two steps that is net displacement: one where every
+branch walked in one direction, zero where every branch came back. It reads the
+direction of the movement and its size together, which neither the step nor the
+KVL residual does on its own — a turning iteration and a converging one both
+produce a falling step, and the residual falls under damping whether or not the
+plan has settled. `proximal_weight` is then the *initial* weight.
+
+A **single** reading below the bar is enough. What is required instead is that
+the reading be about the plan at all: it spans two steps, and the side condition
+$\delta^n = \delta^{n-1}$ drops the readings whose two steps were solved under
+different weights, which read low for that reason alone. Two such readings
+occur — the second iterate of the run, whose predecessor is solved with no
+penalty whatsoever for want of an anchor to write one around, and the iterate
+after each doubling. The latter is the cooldown that lets a new penalty take
+effect before it is judged again; what it costs is one iterate per doubling on a
+run that really is turning, and what it buys is that no doubling is ever ordered
+by the arrival of the previous one.
 
 The weight is never released. That is safe for the same reason the whole term
 is: a fixed point of the penalised step is a fixed point of the unpenalised
@@ -409,29 +425,36 @@ problem, so a weight that ends up too high costs iterations but does not move
 the plan; releasing it, by contrast, re-opens the oscillation it was raised to
 close.
 
-**The ceiling is not optional.** The rule is driven by a *comparison* rather
-than by a level, so once the residual reaches the floor set by the solver
-tolerance it stops falling monotonically and starts wobbling, and every wobble
-upward is read as a rise. That closes a positive feedback loop — doubling the
-weight halves the step, halving the step halves the residual, and the next
-wobble doubles the weight again — in which the run is held together by its own
-damping. Measured on the small meshed test system, an unbounded rule walked the
-weight from 1 to 512 in thirty iterations.
+**The ceiling is not optional.** The rule reads a *direction* rather than a
+level, and a direction is meaningless once the steps are numerical noise: the
+sign is then random, so half the iterates of a run that has already stopped
+would be read as turns and ratchet the weight up. `PROXIMAL_STEP_FLOOR` catches
+the clearly dead case — a window moving less than $10^{-9}$ of the plan's own
+capital is read as a fixed point rather than as a direction — and the ceiling
+bounds whatever gets through. The failure it prevents was measured on the
+abandoned residual-rise signal, where every wobble of a residual sitting at the
+solver tolerance read as a rise: unbounded, that rule walked the weight from 1
+to 512 in thirty iterations on the small meshed test system.
 
 The default ceiling of 4 is what the rule needed on the systems this was
 measured on rather than a margin above them: on the 1250 bus case the weight
 settled at 3 to 4 and never approached a higher bound.
 
-For the same reason the rule is **not free on a system that never needed it**:
-on the small meshed system a fixed weight of 1.0 reaches an exact fixed point
-in 17 iterations, where the rule at the default ceiling takes 30 to reach the
-same point at the same cost. It is on by default all the same, because the
-failure it prevents is silent - a weight below the stability boundary produces
-a *converged* run whose plan is still moving, and whose cost is lower than that
-plan can deliver - while the failure it causes is visible in the iteration
-count. Set `proximal_adaptive=False` where a fixed weight is known to work.
+The rule **costs nothing on a system that never needed it**, which is what the
+earlier signals did not manage: on the small meshed system, where a fixed weight
+of 1.0 reaches an exact fixed point in 16 iterations, it reproduces that run
+iterate for iterate and never raises the weight, `progress` staying between 0.87
+and 1.00. Triggering on a rise in the step took 29 iterations there and
+triggering on a rise in the KVL residual 30, both by damping a run that was
+already converging. It is on by default because the failure it prevents is
+silent — a weight below the stability boundary produces a *converged* run whose
+plan is still moving, and whose cost is lower than that plan can deliver. Set
+`proximal_adaptive=False` where a fixed weight is known to work.
 
-Measured on the 1250 bus case, from the default initial weight of 1.0:
+Measured on the 1250 bus case, from the default initial weight of 1.0. These
+runs predate the cooldown described above, which delays each doubling by one
+iterate; what they establish is the failure the rule prevents rather than the
+iteration count it reaches now:
 
 | run | converges at | step | KVL residual |
 | --- | --- | --- | --- |
@@ -504,8 +527,8 @@ defaulting to 2. This is the whole criterion; `min_iterations` is the only other
 thing that can hold the run open.
 
 **Why not the capacity change.** Algorithm 1 stops on
-$\mathrm{step}^n = \lVert F^{n,*} - F^{n,\mathrm{fix}} \rVert_2 / \lVert F^0 \rVert_2$,
-but that is a step size, not a measure of convergence. It is not invariant under
+$\mathrm{step}^n = \lVert F^{n,*} - F^{n,\mathrm{fix}} \rVert_1 / \lVert F^0 \rVert_1$,
+unweighted, but that is a step size, not a measure of convergence. It is not invariant under
 the exchange of degenerate alternative optima, so it keeps bouncing long after
 the solution has settled, and a step can undercut a threshold by accident while
 the cost is still drifting. The cost, by contrast, is invariant under the

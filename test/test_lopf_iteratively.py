@@ -110,7 +110,8 @@ def test_the_weight_is_doubled_while_the_plan_turns(monkeypatch):
     that is net displacement over the last two steps. On an orbit every branch
     comes back to where it started, so it reads zero on every iterate and the
     weight doubles after a low-progress reading, with one cooldown iteration
-    between doublings, until the ceiling stops it.
+    between doublings, until the ceiling stops it. The first reading of the run
+    is one of those cooldowns: it spans the unpenalised first iterate.
     """
     n = _orbit(monkeypatch, _build_simple_network(), [150.0, 100.0])
 
@@ -125,14 +126,12 @@ def test_the_weight_is_doubled_while_the_plan_turns(monkeypatch):
     measured = accepted.progress.iloc[1:]
     assert (measured < 0.5).all(), accepted.progress.tolist()
     weights = accepted.proximal.tolist()
-    assert weights[1] == 1.0, weights
-    # Each low-progress iterate doubles the following weight, then the next
-    # iterate is a cooldown step under that new weight.
-    for i in range(2, len(weights)):
-        if i % 2 == 0:
-            assert weights[i] == pytest.approx(2.0 * weights[i - 1]), weights
-        else:
-            assert weights[i] == weights[i - 1], weights
+    # Iteration 1 runs unpenalised for want of an anchor, so the reading of
+    # iteration 2 spans two weights and cannot be read as a turn; from there
+    # each reading taken under an unchanged weight doubles the weight of the
+    # iterate after it, and that iterate is the cooldown step whose own
+    # reading spans the change in turn. The ceiling is far above this run.
+    assert weights == [0.0, 1.0, 1.0, 2.0, 2.0, 4.0], weights
 
 
 def test_a_single_turn_raises_the_weight(monkeypatch):
@@ -140,6 +139,45 @@ def test_a_single_turn_raises_the_weight(monkeypatch):
     Here the plan overshoots once and then walks straight down. One low
     progress reading is enough to increase the proximal weight for the next
     iteration, even though subsequent steps clear the bar.
+
+    The overshoot is placed at the third iterate rather than the second, so
+    that the two steps the low reading is measured over were both solved under
+    the same weight. A reading spanning the unpenalised first iterate is about
+    the arrival of the penalty and not about the plan, which is what
+    ``test_the_first_penalised_iterate_is_not_read_as_a_turn`` pins down.
+    """
+    n = _plan_sequence(
+        monkeypatch,
+        _build_simple_network(),
+        [200.0, 260.0, 210.0, 170.0, 140.0, 120.0],
+    )
+
+    n.optimize.optimize_transmission_expansion_iteratively(
+        max_iterations=6, proximal_weight=1.0, proximal_adaptive=True,
+        proximal_ceiling=1024.0,
+    )
+
+    accepted = n.iteration_log[n.iteration_log.accepted]
+    # only the step back from 260 to 210 reverses; every later step continues
+    progress = accepted.progress.dropna()
+    assert (progress < 0.5).sum() == 1, progress.tolist()
+    assert accepted.proximal.iloc[1] == 1.0
+    assert accepted.proximal.iloc[2] == 1.0
+    assert accepted.proximal.iloc[3] == 2.0
+    assert (accepted.proximal.iloc[4:] == 2.0).all(), accepted.proximal.tolist()
+
+
+def test_the_first_penalised_iterate_is_not_read_as_a_turn(monkeypatch):
+    """
+    The first iterate has no anchor, so it is solved without the term at all
+    and the second is the first step the penalty shapes. The reading of that
+    second iterate therefore compares two steps taken under different weights
+    and reads low for that reason alone: the weight must stay where the caller
+    put it, exactly as it does for the iterate after a doubling.
+
+    Here the plan reverses once, between the first and second steps, and walks
+    straight down afterwards - so the only low reading of the run is the one
+    that spans the arrival of the penalty, and nothing may double.
     """
     n = _plan_sequence(
         monkeypatch,
@@ -153,12 +191,13 @@ def test_a_single_turn_raises_the_weight(monkeypatch):
     )
 
     accepted = n.iteration_log[n.iteration_log.accepted]
-    # only the step back from 200 to 150 reverses; every later step continues
     progress = accepted.progress.dropna()
+    # the step back from 200 to 150 is the only reversal, and it is measured
+    # on the second iterate
     assert (progress < 0.5).sum() == 1, progress.tolist()
-    assert accepted.proximal.iloc[1] == 1.0
-    assert accepted.proximal.iloc[2] == 2.0
-    assert (accepted.proximal.iloc[3:] == 2.0).all(), accepted.proximal.tolist()
+    assert progress.index[0] == 2 and progress.iloc[0] < 0.5, progress.tolist()
+    assert accepted.proximal.iloc[0] == 0.0
+    assert (accepted.proximal.iloc[1:] == 1.0).all(), accepted.proximal.tolist()
 
 
 def test_the_adaptive_weight_stops_at_the_ceiling(monkeypatch):

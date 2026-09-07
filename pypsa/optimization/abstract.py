@@ -44,13 +44,16 @@ PROXIMAL_ADAPTIVE_FACTOR = 2.0
 # bands meet rather than leaving a gap, so the bar is a boundary drawn inside a
 # continuum, not a value picked out of an empty interval.
 #
-# What holds it down here rather than up against the stalling band is the
-# iterate that immediately follows a doubling. Its step was solved under a
-# different penalty from the one before it, so the measure compares two steps
-# from two regimes and reads low for that reason alone: 0.48 to 0.65 on runs
-# that were not turning at all, one of them closing 69 % of its own remaining
-# distance. A bar above those readings would raise the weight again on the
-# strength of an artefact, on every doubling.
+# Inside that continuum the value sits near the upper end of the stalling band
+# rather than above it, which is the conservative end: a stall whose readings
+# fall in the last of its own band, 0.66 to 0.68, goes unanswered. What used to
+# force the bar down this far was the artefact of a
+# change of weight - the iterate after a doubling compares two steps solved
+# under two penalties and read 0.48 to 0.65 on runs that were not turning at
+# all, one of them closing 69 % of its own remaining distance. Those readings
+# are now passed over by the rule itself, which judges only steps solved under
+# one weight, so they no longer constrain the bar; the value is kept because it
+# is the one that was measured, not because the artefact still holds it.
 PROXIMAL_TURN_BAR = 0.65
 
 # A window of steps that moves less than this share of the capital of the plan
@@ -58,6 +61,14 @@ PROXIMAL_TURN_BAR = 0.65
 # read as a fixed point, which is what keeps the rule from ratcheting the
 # weight up on a run that has already stopped.
 PROXIMAL_STEP_FLOOR = 1e-9
+
+# Global constraints written over the transmission capacities themselves, which
+# is what lets the report solve leave them out of its own model: it holds those
+# capacities. See ``exclude_transmission_limits``.
+TRANSMISSION_LIMIT_TYPES = (
+    "transmission_expansion_cost_limit",
+    "transmission_volume_expansion_limit",
+)
 
 
 @dataclass
@@ -248,12 +259,11 @@ def optimize_transmission_expansion_iteratively(
         Whether the weight is raised during the run when the step outruns the
         linearisation it was taken on.
 
-        With ``False`` the weight is a constant. With ``True`` it is doubled
-        once *two consecutive* iterates, both solved under the same weight,
-        report that most of the capital their steps moved was moved back
-        again:
+        With ``False`` the weight is a constant. With ``True`` it is doubled as
+        soon as *one* iterate reports that most of the capital its step and the
+        step before it moved was moved back again:
 
-        ``progress < 0.5 twice in a row at one delta  =>  delta <- 2 * delta``
+        ``progress < 0.65 under an unchanged delta  =>  delta <- 2 * delta``
 
         ``progress`` is the share of the moved capital that is net
         displacement over those two steps - one if every branch walked in one
@@ -261,16 +271,19 @@ def optimize_transmission_expansion_iteratively(
         accepted iterate in ``n.iteration_log``. It reads the direction of the
         movement and its size together; see ``displacement`` for why neither
         alone is enough, and ``PROXIMAL_TURN_BAR`` for where the bar comes
-        from and what holds it down.
+        from.
 
-        The count restarts whenever a reading clears the bar and whenever the
-        weight changes, so the first reading after a doubling - which compares
-        two steps solved under different penalties and reads low for that
-        reason alone - can arm the gate but can never trip it on its own. What
-        the gate buys is that a single pair of steps that happen to disagree no
-        longer damps a run that is walking; what it costs is one extra iterate
-        per doubling on a run that really is turning, an orbit reading low on
-        every iterate it runs for.
+        A single reading is enough, but only where the reading is about the
+        plan at all. It spans two steps, and where those two were solved under
+        *different* weights it reads low for that reason alone; both such
+        readings are therefore passed over. One is the second iterate of the
+        run, whose predecessor was solved with no penalty whatsoever for want
+        of an anchor to write one around. The other is the iterate after each
+        doubling, which is the cooldown that lets a new penalty take effect
+        before it is judged again. What that costs is one iterate per doubling
+        on a run that really is turning, an orbit reading low on every iterate
+        it runs for; what it buys is that no doubling is ever ordered by the
+        arrival of the previous one.
 
         It is on by default because the systems it is aimed at cannot be
         recognised in advance and fail silently when it is off: a weight below
@@ -280,10 +293,9 @@ def optimize_transmission_expansion_iteratively(
         a period-2 orbit at iteration 16 with a relative KVL residual of
         1.6e-4, while the rule from the same start converges at iteration 18
         with 8.7e-7 - and beats the best fixed weight on that system, 2.5, by
-        five iterations. That run predates the confirmation gate described
-        above, which delays each doubling by one iterate; what it establishes
-        is the failure the rule prevents, not the iteration count it reaches
-        now.
+        five iterations. That run predates the cooldown described above, which
+        delays each doubling by one iterate; what it establishes is the failure
+        the rule prevents, not the iteration count it reaches now.
 
         It costs nothing on a system that never needed it, which earlier
         signals did not manage: on the small meshed test system, where a fixed
@@ -431,13 +443,18 @@ def optimize_transmission_expansion_iteratively(
         c for c in ("Line", "LineX") if c in n.components and not n.df(c).empty
     ]
     # DC links carry no voltage law, so the iteration does not linearise them
-    # - but they are part of the plan, and the solve that closes a run has to
-    # hold them as well as the AC capacities, see ``pin_capacities``
+    # - but they are transmission capacity, and the solve that closes a run has
+    # to hold them as well as the AC capacities, see ``pin_capacities``. Only
+    # the DC ones: a ``Link`` is equally how a network models an electrolyser
+    # or any other conversion asset, and those are re-optimised by the report
+    # solve like the dispatch and the generation capacity rather than held.
     link_ext_i = pd.Index([], name="Link")
     if "Link" in n.components and not n.links.empty:
         extendable = n.links.get("p_nom_extendable")
         if extendable is not None:
-            link_ext_i = n.links.index[extendable.fillna(False).astype(bool)]
+            link_ext_i = n.links.index[
+                extendable.fillna(False).astype(bool) & n.links["carrier"].eq("DC")
+            ]
     if not branch_components:
         return solve_once(snapshots)
 
@@ -756,19 +773,20 @@ def optimize_transmission_expansion_iteratively(
         current: pd.Series, previous: pd.Series, initial: pd.Series
     ) -> float:
         r"""
-        Size of the step, in the capital-cost weighted Euclidean norm.
+        Size of the step, in the (unweighted) 1-norm.
 
         .. math::
-            \mathrm{step} = \sqrt{\frac{\sum_l c_l (F_l - F'_l)^2}
-                                        {\sum_l c_l (F^0_l)^2}}
+            \mathrm{step} = \frac{\sum_l \lvert F_l - F'_l \rvert}
+                                  {\sum_l \lvert F^0_l \rvert}
 
-        over the extendable branches. Weighting by the capital cost is what
-        makes the measure about the *plan* rather than about megawatts: an
-        expensive branch that keeps moving says the plan is not settled, while
-        the same movement on a cheap one barely changes it, and an unweighted
-        norm cannot tell the two apart. It is the same weight the proximal
-        term charges in, so the quantity the step control prices and the
-        quantity the convergence test reads are the same quantity.
+        over the extendable branches: the total capacity moved this step
+        against the total capacity the run started with, in megawatts rather
+        than in dollars. Unlike the proximal term, which does weight by
+        capital cost - since that is what a run needs to damp a step by - the
+        convergence side of the run does not need step to price a branch the
+        way the penalty does, because ``cost_threshold`` is what actually
+        gates convergence; ``step`` is read alongside it only as a diagnostic
+        of whether the plan is still moving.
 
         The reference is the *initial* capacity vector, fixed for the run, so
         the measure is a displacement relative to the system the run started
@@ -776,13 +794,12 @@ def optimize_transmission_expansion_iteratively(
         """
         if ext_branches.empty:
             return 0.0
-        weights = move_costs.to_numpy()
         reference = initial.loc[ext_branches].to_numpy()
-        denom = float(np.sqrt((weights * reference**2).sum()))
+        denom = float(np.abs(reference).sum())
         if denom <= 0.0:
             denom = 1e-12
         delta = (current - previous).loc[ext_branches].to_numpy()
-        return float(np.sqrt((weights * delta**2).sum()) / denom)
+        return float(np.abs(delta).sum() / denom)
 
     # weights of the proximal term: moving a branch capacity is penalised in
     # units of the capital cost of that branch
@@ -1127,9 +1144,18 @@ def optimize_transmission_expansion_iteratively(
         carry no voltage law and so never enter the iteration's own controls,
         but they are transmission capacity all the same: re-optimised at fixed
         AC capacities they make the report a different plan rather than the
-        price of this one. Everything that is not capacity - the series
-        compensation, the dispatch, the storage - is left free, which is what
-        makes this the cost *of* the plan.
+        price of this one. Only the ``carrier == 'DC'`` ones, though - a
+        ``Link`` is equally how an electrolyser or any other conversion asset
+        is modelled, and those belong with the dispatch below rather than with
+        the plan.
+
+        Everything that is not transmission capacity - the series compensation,
+        the conversion capacities, the dispatch, the storage - is left free,
+        which is what makes this the cost *of* the plan. Holding a conversion
+        asset here would not only price a plan nobody chose, it would pin it at
+        whatever the solver last returned for it, and an interior-point solve
+        returns a capacity that is *nearly* zero rather than zero - a right
+        hand side of 1e-7 where the constraint means "not built".
         """
         if links is not None and not link_ext_i.empty:
             link_bounds["p_nom_min"] = network.links["p_nom_min"].copy()
@@ -1162,6 +1188,28 @@ def optimize_transmission_expansion_iteratively(
             network.df(c)[f"{attr}_min"] = lower
             network.df(c)[f"{attr}_max"] = upper
 
+    def exclude_transmission_limits(network: Network) -> pd.DataFrame:
+        """
+        Drop the transmission expansion limit rows for the report solve.
+
+        Sound because ``pin_capacities`` holds every variable these sum over:
+        all extendable ``Line`` and ``LineX``, whatever carrier a limit names,
+        and the DC links. A limit written over some *other* link carrier would
+        leave those links free here and is the one case this does not cover -
+        it would also be a transmission limit over a conversion asset.
+        """
+        original = network.global_constraints
+        mask = original["type"].isin(TRANSMISSION_LIMIT_TYPES)
+        if mask.any():
+            network.global_constraints = original.loc[~mask]
+        return original
+
+    def restore_global_constraints(
+        network: Network, original: pd.DataFrame
+    ) -> None:
+        """Restore the global constraints ``exclude_transmission_limits`` dropped."""
+        network.global_constraints = original
+
     if track_iterations:
         for c, attr in pd.Series(nominal_attrs)[list(n.branch_components)].items():
             n.df(c)[f"{attr}_opt_0"] = n.df(c)[f"{attr}"]
@@ -1182,10 +1230,15 @@ def optimize_transmission_expansion_iteratively(
     # Step vector of the previous accepted iterate, which is what
     # ``proximal_adaptive`` measures the displacement against.
     previous_step_vector: np.ndarray | None = None
-    # A doubling changes the penalty regime. Keep the following iterate as a
-    # cooldown step, so its low progress cannot immediately trigger another
-    # doubling.
-    proximal_raised_previous_iteration = False
+    # Weight the previous accepted iterate was solved under. A reading
+    # compares two steps, so it is only about the plan where both of them were
+    # solved under the same weight: across a change of weight it reads low for
+    # that reason alone and cannot be attributed to the iteration turning.
+    # Both changes that occur are covered - the first anchored solve, which
+    # follows the unpenalised first iterate, and the iterate after a doubling,
+    # which is the cooldown that lets a new penalty take effect before it is
+    # judged again.
+    previous_weight: float | None = None
 
     reference_terms: pd.DataFrame | None = None
     # last solved DC link capacities, held by the report solve alongside the AC
@@ -1366,28 +1419,24 @@ def optimize_transmission_expansion_iteratively(
                 else float("nan")
             )
             # A window whose capital was mostly moved back is a turning step.
-            # Shorten the *next* step immediately, unless the preceding
-            # iteration already raised the weight: that one-iteration cooldown
-            # lets the new penalty take effect before it is judged again.
+            # Shorten the *next* step immediately, unless the two steps it was
+            # measured over were solved under different weights: such a reading
+            # is about the change of penalty rather than about the plan.
             can_raise_proximal = (
                 proximal_on
                 and proximal_adaptive
                 and not converged
-                and not proximal_raised_previous_iteration
+                and previous_weight is not None
+                and weight == previous_weight
                 and np.isfinite(progress)
                 and progress < PROXIMAL_TURN_BAR
             )
             if can_raise_proximal:
-                previous_proximal_delta = proximal_delta
                 proximal_delta = min(
                     proximal_delta * PROXIMAL_ADAPTIVE_FACTOR, proximal_ceiling
                 )
-                proximal_raised_previous_iteration = (
-                    proximal_delta > previous_proximal_delta
-                )
-            else:
-                proximal_raised_previous_iteration = False
             previous_step_vector = step_vector
+            previous_weight = weight
 
             cost_change = (
                 abs(cost - cost_history[-1]) / max(abs(cost), 1e-12)
@@ -1500,12 +1549,16 @@ def optimize_transmission_expansion_iteratively(
 
     update_line_params(n, current_def)
 
+    original_global_constraints = n.global_constraints
     try:
         n._kvl_capacity_sensitivity = None
         # the capacities are held at the last iterate rather than released:
         # this solve reports that plan, it does not look for another one, see
         # ``pin_capacities``
         pin_capacities(n, current_def, current_links)
+        # pinned capacities leave the transmission expansion limits nothing to
+        # decide; see ``exclude_transmission_limits``
+        original_global_constraints = exclude_transmission_limits(n)
         n.calculate_dependent_values()
         status, condition = solve_once(
             snapshots,
@@ -1520,6 +1573,7 @@ def optimize_transmission_expansion_iteratively(
         n._kvl_capacity_sensitivity = None
         restore_nominal_bounds(n)
         unpin_links(n)
+        restore_global_constraints(n, original_global_constraints)
 
     if status == "ok":
         return status, condition

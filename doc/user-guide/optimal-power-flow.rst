@@ -651,21 +651,27 @@ the undamped problem and the converged plan does not depend on the weight the
 run needed to reach it.
 
 ``proximal`` (default ``True``) switches the term on and off, and
-``proximal_weight`` (default ``1.0``) sets its weight. Each system has a
+``proximal_weight`` (default ``0.5``) sets its weight. Each system has a
 stability boundary below which the iteration turns in a limit cycle instead of
 contracting, so a run that oscillates wants a larger weight. Under
 ``scheme="fixed_point"`` the term is inactive: that scheme freezes rather than
 linearises the voltage law and leaves no linearisation error to control.
 
 ``proximal_adaptive`` (default ``True``) makes the run find that weight for
-itself: whenever the relative KVL residual of an accepted iterate exceeds the
-one before it, the weight is doubled, up to ``proximal_ceiling`` (default
-``4``). The residual is the error of the linear model the step was solved on,
-so a rise is direct evidence that the step went past where the linearisation
-holds. The weight is never released again, which is safe because a fixed point
-of the penalised step is a fixed point of the unpenalised problem: too heavy a
-weight costs iterations, not accuracy. ``proximal_weight`` is therefore the
-*initial* weight.
+itself: whenever an accepted iterate reports that most of the capital its step
+and the step before it moved was moved back again, the weight is doubled, up to
+``proximal_ceiling`` (default ``4``). That reading is ``progress`` in
+``n.iteration_log`` - the share of the moved capital that is net displacement
+over the two steps, one where every branch walked in one direction and zero
+where every branch came back - and the weight is doubled as soon as a single
+reading falls below ``0.65``. A reading taken across a change of weight is
+passed over, since it compares two steps solved under two penalties and reads
+low for that reason alone: that exempts the second iterate of the run, whose
+predecessor is solved without the term for want of an anchor, and the iterate
+after each doubling. The weight is never released again, which is safe because
+a fixed point of the penalised step is a fixed point of the unpenalised
+problem: too heavy a weight costs iterations, not accuracy.
+``proximal_weight`` is therefore the *initial* weight.
 
 It is the default because a weight below a system's stability boundary fails
 *silently*: the run reports itself converged on a plan that is still moving,
@@ -676,10 +682,11 @@ converges at iteration 18 with 8.7e-7 - and reaches it five iterations sooner
 than the best fixed weight for that system.
 
 Set ``proximal_adaptive=False`` where a fixed weight is known to work. The rule
-is driven by a comparison, not by a level, so once the residual reaches the
-floor set by the solver tolerance every wobble upward reads as a rise and the
-weight climbs on a run that was already converging; the ceiling is what bounds
-that, and the cost is over-damping rather than a wrong answer.
+reads a direction, not a level, so once the steps are numerical noise their
+sign is random and half the iterates of a run that has already stopped would
+read as turns; a window moving less than ``1e-9`` of the plan's own capital is
+read as a fixed point rather than as a direction, and the ceiling bounds
+whatever gets through. The cost is over-damping rather than a wrong answer.
 
 Both schemes stop once the **system cost** has changed by less than
 ``cost_threshold`` (default ``1e-5``) in each of the last ``cost_window``
