@@ -182,15 +182,17 @@ def optimize_transmission_expansion_iteratively(
 
         The step is the gap between the plan a solve returns and the
         capacities its own impedances were taken at, measured in the
-        capital-cost weighted Euclidean norm and referred to the initial
-        capacities,
+        (unweighted) 1-norm and referred to the initial capacities,
 
-        ``sqrt(sum_l c_l (s_nom_opt - _s_nom_def)**2 / sum_l c_l s_nom_0**2)``,
+        ``sum_l |s_nom_opt - _s_nom_def| / sum_l s_nom_0``,
 
-        so this bounds how much of the plan's *capital* is still undetermined
-        when the run stops. It is weighted with the same capital cost the
-        proximal term charges in, so the quantity that is damped and the
-        quantity that is tested are the same one. It is what separates a fixed point
+        so this bounds how much of the plan's *capacity* is still undetermined
+        when the run stops, in megawatts rather than in dollars. The proximal
+        term does weight by capital cost, since that is what a step has to be
+        damped by, but the convergence test does not need to price a branch the
+        way the penalty does: ``cost_threshold`` is what gates convergence, and
+        the step is read alongside it as a diagnostic of whether the plan is
+        still moving. It is what separates a fixed point
         from an orbit, and it is also the only signal that catches a run held
         together by its own damping: a heavy proximal weight shortens the step,
         the change of the cost and the KVL residual alike, so the cost test can
@@ -758,8 +760,8 @@ def optimize_transmission_expansion_iteratively(
         Two properties of the form matter. The modulus is taken **per branch**
         before the sum, so a branch growing while another shrinks does not
         cancel into a false reading of progress. And the capital cost weights
-        it, as it weights the step and the proximal term, so the many small
-        branches that swap between degenerate optima cannot outvote the plan.
+        it, as it weights the proximal term, so the many small branches that
+        swap between degenerate optima cannot outvote the plan.
         """
         weights = move_costs.to_numpy()
         gross = float((weights * (np.abs(current) + np.abs(previous))).sum())
@@ -815,8 +817,10 @@ def optimize_transmission_expansion_iteratively(
         proximal_costs[c] = weights.fillna(fallback)
 
     # capital cost of each extendable branch, aligned on ``ext_branches``.
-    # Both the proximal term and the step measure are weighted with it: what
-    # matters about a step is the capital it moves, not the megawatts.
+    # The proximal term is charged in it and ``displacement`` weights with it:
+    # what matters about a damped or a reversed step is the capital it moves,
+    # not the megawatts. The convergence measure ``step`` is unweighted, see
+    # ``relative_capacity_change``.
     move_costs = (
         pd.concat(proximal_costs, names=["component", "name"]).reindex(ext_branches)
         if branch_components
