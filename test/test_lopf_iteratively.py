@@ -818,10 +818,12 @@ def test_kvl_capacity_sensitivity_enters_constraint():
     vars_ = constraint.vars.values
     coeffs = constraint.coeffs.values
     s_nom_def = n.lines.at["ac", "s_nom"]
+    # the rows carry the scaling the model derived from their own coefficients
+    kvl_scale = n._kvl_scale
     for cycle, sign in orientation.items():
         # the deviation is relative, so the sensitivity is scaled by the
         # linearisation capacity rather than divided out of the right-hand side
-        expected = -1e4 * sign * 0.25 * s_nom_def
+        expected = -kvl_scale * sign * 0.25 * s_nom_def
         found = coeffs[:, cycle, :][vars_[:, cycle, :] == label]
         assert np.allclose(found, expected)
 
@@ -829,9 +831,10 @@ def test_kvl_capacity_sensitivity_enters_constraint():
     # no longer enters the voltage law, whose right-hand side stays zero
     assert np.allclose(constraint.rhs.values, 0.0)
 
-    # u = F / F_def - 1
-    assert np.allclose(definition.rhs.values, 1.0)
+    # u = F / F_def - 1, written scaled by sqrt(F_def)
+    root = np.sqrt(s_nom_def)
+    assert np.allclose(definition.rhs.values, root)
     assert np.allclose(
         np.sort(definition.coeffs.values, axis=-1),
-        np.sort(np.array([1.0 / s_nom_def, -1.0]), axis=-1),
+        np.sort(np.array([1.0 / root, -root]), axis=-1),
     )

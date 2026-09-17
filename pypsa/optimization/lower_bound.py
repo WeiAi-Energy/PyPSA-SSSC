@@ -91,10 +91,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: The voltage law rows of :mod:`pypsa.optimization.constraints` are scaled by
+#: The cycle rows built here, and the lifted variable they carry, are scaled by
 #: this factor to put their coefficients on the scale of the other rows. The
-#: lifted variable is stored with the same scaling, so that the McCormick rows
-#: and the cycle rows are conditioned like the constraints they replace.
+#: voltage law of :mod:`pypsa.optimization.constraints` used to carry the same
+#: fixed factor and now derives one per case in
+#: :func:`~pypsa.optimization.constraints.kirchhoff_voltage_scale`; the two
+#: models are solved separately, so the scalings only have to be internally
+#: consistent, which is why this one is left fixed.
 KVL_SCALE = 1e4
 
 BRANCH_COMPONENTS = ("Line", "LineX")

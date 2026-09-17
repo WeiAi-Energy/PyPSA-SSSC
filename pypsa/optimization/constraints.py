@@ -740,6 +740,23 @@ def define_relative_capacity_deviation(
     that solver the reformulation is a no-op, and the choice between the two
     forms is only felt on a solver that leaves the equation alone.
 
+    The defining equation itself is written scaled by :math:`\\sqrt{\\bar{F}}`,
+
+    .. math::
+        F_l / \\sqrt{\\bar{F}_l} - \\sqrt{\\bar{F}_l} u_l = \\sqrt{\\bar{F}_l}
+
+    rather than in its natural form with the coefficients ``1 / F_def`` and
+    ``1``. The row is an equality, so any positive scaling of both sides is
+    exact; what the square root buys is the scaling that minimises *this row's*
+    own coefficient range, since a row with coefficients ``a`` and ``b`` is
+    centred by dividing it by ``sqrt(a b)``. In its natural form the row
+    reaches down to ``1 / max_l F_def``, which on a US case with 15 GW branches
+    is 7e-5 and sets the smallest coefficient of the whole matrix; scaled it
+    runs ``1 / sqrt(F_def) .. sqrt(F_def)``, i.e. 8e-3 .. 1.2e+2, and the
+    matrix minimum falls back to rows that have nothing to do with the
+    linearisation. The row's own spread, ``F_def``, is of course unchanged -
+    only its position is.
+
     Returns
     -------
     labels : pandas.Series
@@ -755,19 +772,138 @@ def define_relative_capacity_deviation(
     # the caller floors the linearisation capacity away from zero, this only
     # guards against a division by zero
     scale = scale.where(scale.abs() > 0.0, 1.0)
-    inverse = DataArray(1.0 / scale.to_numpy(), coords=[index], dims=[dim])
+    # row scaling: sqrt(F_def), see above
+    root = np.sqrt(scale.abs().to_numpy())
+    inverse = DataArray(root / scale.to_numpy(), coords=[index], dims=[dim])
+    weight = DataArray(root, coords=[index], dims=[dim])
 
     # F_l >= 0 makes u_l >= -1 an exact bound, independent of the step size
     deviation = m.add_variables(
         lower=-1.0, coords=[index], name=f"{c}-{attr}_relative"
     )
     m.add_constraints(
-        capacity * inverse - deviation,
+        capacity * inverse - deviation * weight,
         "=",
-        1.0,
+        weight,
         name=f"{c}-{attr}_relative-definition",
     )
     return deviation.labels.to_pandas()
+
+
+#: Row scaling of the voltage law used when its coefficient band cannot be
+#: measured. It is also the fixed scaling these rows carried before
+#: :func:`kirchhoff_voltage_scale` derived one from the case, and the value
+#: :mod:`pypsa.optimization.lower_bound` still scales its own lifted cycle rows
+#: by.
+KVL_SCALE_DEFAULT = 1e4
+
+
+def kirchhoff_voltage_scale(
+    cycle_bases: Sequence[Sequence[tuple]],
+    s_nom_def: pd.Series,
+    sensitivity: pd.DataFrame | None = None,
+    with_q: bool = False,
+    default: float = KVL_SCALE_DEFAULT,
+) -> float:
+    """
+    Row scaling that centres the coefficients of the voltage law on one.
+
+    The voltage law is homogeneous - its right hand side is identically zero -
+    so scaling all of its rows by any positive constant is exact and changes
+    neither the solution nor the residual it is checked against, only where the
+    row's coefficients sit relative to the rest of the matrix. Its natural
+    coefficients are per-unit impedances of order 1e-6 .. 1e-2, which is why a
+    constant was applied at all.
+
+    A fixed constant cannot know where the band ends up, though. The band is
+    built from three families that scale differently with the case - the flow
+    coefficients ``x_pu_eff``, the compensation coefficients ``1 / F_def`` and,
+    once the voltage law is linearised in the capacity, the branch terms
+    ``alpha F_def`` themselves - and the last of these grows with the flows, so
+    on a large case the historical 1e4 pushed the top of the band three orders
+    of magnitude above every other row of the model. Scaling instead by
+    ``1 / sqrt(min * max)`` puts the geometric centre of the band on one, which
+    is the choice that minimises the largest distance any voltage-law
+    coefficient has to travel from one - the best a single constant can do.
+
+    What this does *not* do is narrow the band: the spread between the smallest
+    and the largest coefficient is a property of the network, not of the
+    scaling, and moving the rows leaves it untouched (see
+    :func:`define_relative_capacity_deviation` for where that spread comes
+    from).
+
+    Parameters
+    ----------
+    cycle_bases : sequence
+        One cycle basis per investment period, each as returned by
+        :func:`kirchhoff_voltage_cycles`.
+    s_nom_def : pandas.Series
+        Linearisation capacities indexed by ``(component, name)``.
+    sensitivity : pandas.DataFrame, optional
+        Capacity sensitivities, if the voltage law is linearised.
+    with_q : bool, default False
+        Whether SSSC compensation terms enter the voltage law.
+    default : float
+        Scaling returned when the band is empty or degenerate.
+
+    Returns
+    -------
+    float
+    """
+    low = inf
+    high = 0.0
+
+    def observe(values: np.ndarray) -> None:
+        nonlocal low, high
+        values = np.abs(np.asarray(values, dtype=float).ravel())
+        values = values[np.isfinite(values) & (values > 0)]
+        if values.size:
+            low = min(low, values.min())
+            high = max(high, values.max())
+
+    used_branches: list[pd.MultiIndex] = []
+    for cycles in cycle_bases:
+        for branches_i, C, weightings, carrier in cycles:
+            used = np.unique(C.indices)
+            if not used.size:
+                continue
+            observe(np.asarray(weightings, dtype=float)[used])
+            branches_used = branches_i[used]
+            if with_q and carrier == "AC":
+                is_x = np.asarray(branches_used.get_level_values(0) == "LineX")
+                if is_x.any():
+                    f_ref = s_nom_def.reindex(branches_used[is_x]).to_numpy()
+                    f_ref = f_ref[np.isfinite(f_ref) & (f_ref != 0)]
+                    observe(1.0 / f_ref)
+            if sensitivity is not None:
+                used_branches.append(branches_used)
+
+    if sensitivity is not None and used_branches:
+        branches = used_branches[0]
+        for other in used_branches[1:]:
+            branches = branches.union(other)
+        columns = sensitivity.columns.intersection(branches)
+        if len(columns):
+            # the coefficient of the deviation is the branch term alpha * F_def
+            observe(
+                sensitivity[columns].to_numpy()
+                * s_nom_def.reindex(columns).to_numpy()
+            )
+
+    if not np.isfinite(low) or low <= 0.0 or high <= 0.0:
+        return default
+
+    scale = 1.0 / np.sqrt(low * high)
+    logger.info(
+        "Voltage law rows scaled by %.4g: the coefficient band [%.2e, %.2e] "
+        "is centred on one at [%.2e, %.2e].",
+        scale,
+        low,
+        high,
+        scale * low,
+        scale * high,
+    )
+    return float(scale)
 
 
 def define_kirchhoff_voltage_constraints(n: Network, sns: pd.Index) -> None:
@@ -796,6 +932,12 @@ def define_kirchhoff_voltage_constraints(n: Network, sns: pd.Index) -> None:
     ``optimize_transmission_expansion_iteratively`` with
     ``scheme='slp'``. Without them, the capacity dependence of the
     impedance is only resolved by the outer fixed-point iteration.
+
+    All rows are scaled by the factor :func:`kirchhoff_voltage_scale` derives
+    from their own coefficients, which is exact because the rows are
+    homogeneous. The factor is recorded as ``n._kvl_scale`` for callers that
+    have to reproduce a coefficient, and changes between outer iterations as
+    the linearisation moves.
     """
     m = n.model
     n.calculate_dependent_values()
@@ -851,12 +993,24 @@ def define_kirchhoff_voltage_constraints(n: Network, sns: pd.Index) -> None:
     added = 0
     periods = sns.unique("period") if n._multi_invest else [None]
 
+    # materialised once: the scaling below is derived from the same cycle bases
+    # the rows are then assembled from, and re-deriving them would repeat the
+    # topology determination
+    cycle_bases = {period: kirchhoff_voltage_cycles(n, period) for period in periods}
+    scale = kirchhoff_voltage_scale(
+        list(cycle_bases.values()),
+        s_nom_def,
+        sensitivity=sensitivity,
+        with_q=line_x_q is not None,
+    )
+    n._kvl_scale = scale
+
     for period in periods:
         snapshots = sns if period is None else sns[sns.get_loc(period)]
         nsns = len(snapshots)
 
         exprs_list = []
-        for branches_i, C, weightings, carrier in kirchhoff_voltage_cycles(n, period):
+        for branches_i, C, weightings, carrier in cycle_bases[period]:
             ssub = s.loc[snapshots, branches_i].to_numpy()
             f_ref = s_nom_def.loc[branches_i].to_numpy()
 
@@ -892,13 +1046,13 @@ def define_kirchhoff_voltage_constraints(n: Network, sns: pd.Index) -> None:
                 rows = C.indices[sl]
                 orientation = C.data[sl]
 
-                coeffs_parts = [1e4 * orientation * weightings[rows]]
+                coeffs_parts = [scale * orientation * weightings[rows]]
                 vars_parts = [ssub[:, rows]]
 
                 if q_sub is not None and has_q[rows].any():
                     sel = has_q[rows]
                     q_rows = rows[sel]
-                    coeffs_parts.append(-1e4 * orientation[sel] / f_ref[q_rows])
+                    coeffs_parts.append(-scale * orientation[sel] / f_ref[q_rows])
                     vars_parts.append(q_sub[:, q_rows])
 
                 if alpha_sub is not None and has_alpha[rows].any():
@@ -906,7 +1060,7 @@ def define_kirchhoff_voltage_constraints(n: Network, sns: pd.Index) -> None:
                     a_rows = rows[sel]
                     # the deviation is relative, so the coefficient of branch l
                     # is alpha_l * F_def_l, i.e. its voltage law term itself
-                    alpha_coeffs = -1e4 * (
+                    alpha_coeffs = -scale * (
                         orientation[sel] * alpha_sub[:, a_rows] * f_ref[a_rows]
                     )
                     # sensitivities the caller truncated away leave a vanishing
@@ -1251,6 +1405,35 @@ def define_store_constraints(n: Network, sns: pd.Index) -> None:
     m.add_constraints(lhs, "=", rhs, name=f"{c}-energy_balance", mask=active)
 
 
+def tangent_row_scale(slope: pd.Series) -> pd.Series:
+    """
+    Row scaling that centres a loss tangent on one, i.e. ``1 / sqrt(slope)``.
+
+    A tangent row is ``loss -/+ slope * s (+ gamma * s_nom) >= rhs``, where the
+    loss carries a unit coefficient and the slope ``rho * u * slope_hat`` is a
+    per-unit resistance times a utilisation - 2e-4 .. 3e-1 on a US case, so the
+    row spans up to four orders of magnitude between its two main coefficients
+    and its smaller one is the smallest coefficient in the whole matrix.
+    Dividing the row by ``sqrt(slope)`` puts both on ``sqrt(slope)`` and
+    ``1 / sqrt(slope)``, i.e. 1.5e-2 .. 6.6e+1, without touching the spread
+    within the row.
+
+    The scaling is exact: an inequality may be multiplied by any positive
+    constant as long as its right hand side follows, which the caller does. It
+    is also one-sided - every factor is larger than one for a slope below one -
+    so no row is loosened relative to the solver's absolute feasibility
+    tolerance.
+
+    Rows whose slope vanishes (a branch with no resistance, or one that cannot
+    carry flow) are left alone, since there is nothing to centre.
+    """
+    positive = slope > 0.0
+    return pd.Series(
+        np.where(positive, 1.0 / np.sqrt(slope.where(positive, 1.0)), 1.0),
+        index=slope.index,
+    )
+
+
 def define_loss_constraints(
     n: Network, sns: pd.Index, c: str, transmission_losses: int
 ) -> None:
@@ -1261,6 +1444,10 @@ def define_loss_constraints(
     scaled as r = rho / s_nom and the flow range as p_max = s_max_pu * s_nom,
     the segment slopes are capacity-independent and the segment offsets are
     linear in s_nom, so no outer iteration on r is required for the losses.
+
+    Every row is scaled by :func:`tangent_row_scale`, which centres its two
+    main coefficients on one instead of leaving the slope as the smallest
+    coefficient of the matrix.
 
     Parameters
     ----------
@@ -1346,16 +1533,17 @@ def define_loss_constraints(
         offset = base * u.reindex(fix_i) * s_nom_def.reindex(fix_i)
         for j in range(n_side):
             slope = base * slope_hat[j]
-            rhs = -offset * offset_hat[j]
+            weight = tangent_row_scale(slope)
+            rhs = -offset * offset_hat[j] * weight
             n.model.add_constraints(
-                n.model.linexpr((1, loss_fix), (-slope, flow_fix)),
+                n.model.linexpr((weight, loss_fix), (-slope * weight, flow_fix)),
                 ">=",
                 rhs,
                 name=f"{c}-fix-loss_tangents-{j + 1}-1",
                 mask=active,
             )
             n.model.add_constraints(
-                n.model.linexpr((1, loss_fix), (slope, flow_fix)),
+                n.model.linexpr((weight, loss_fix), (slope * weight, flow_fix)),
                 ">=",
                 rhs,
                 name=f"{c}-fix-loss_tangents-{j + 1}--1",
@@ -1371,15 +1559,24 @@ def define_loss_constraints(
         for j in range(n_side):
             slope = base * slope_hat[j]
             gamma = base * u.reindex(ext_i) * offset_hat[j]
+            weight = tangent_row_scale(slope)
             n.model.add_constraints(
-                n.model.linexpr((1, loss_ext), (-slope, flow_ext), (gamma, capacity)),
+                n.model.linexpr(
+                    (weight, loss_ext),
+                    (-slope * weight, flow_ext),
+                    (gamma * weight, capacity),
+                ),
                 ">=",
                 0,
                 name=f"{c}-ext-loss_tangents-{j + 1}-1",
                 mask=active,
             )
             n.model.add_constraints(
-                n.model.linexpr((1, loss_ext), (slope, flow_ext), (gamma, capacity)),
+                n.model.linexpr(
+                    (weight, loss_ext),
+                    (slope * weight, flow_ext),
+                    (gamma * weight, capacity),
+                ),
                 ">=",
                 0,
                 name=f"{c}-ext-loss_tangents-{j + 1}--1",

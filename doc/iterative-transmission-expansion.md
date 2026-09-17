@@ -488,11 +488,21 @@ three convergence signals can be produced by the damping rather than by
 stationarity. `step` in `n.iteration_log` is what tells the two apart: a damped
 iterate is still moving, a converged one is not.
 
-The penalty also acts as a hurdle rate on capital reallocation, and that is how
-it can go wrong: a reallocation between two plans of equal cost gains nothing
-and is refused, which is the property that breaks the degeneracy, but a large
-enough $\delta$ lets that dead zone decide the plan rather than damp the
-iteration.
+The degeneracy-breaking of section 6 survives the quadratic form, but as strict
+convexity rather than as the $\ell_1$ dead zone: a reallocation between two
+plans of equal cost has $r_\ell = 0$, so $u_\ell = 0$ is the unique minimiser
+and the move is refused, while a move worth a little is taken at a reduced size
+rather than refused with it. The failure mode changes with it. A $\delta$ past
+what the system needs does not freeze the plan the way the dead zone did, it
+walks it in slowly: `step` contracts geometrically at a ratio that climbs
+towards one while `progress` stays near one — a monotone walk, not an orbit —
+and `cost_change` contracts with it, so the criterion of section 7 is met while
+the plan is still moving in one direction. Reading the two columns of
+`n.iteration_log` together is what separates that from convergence, since a
+rising $\mathrm{step}^n/\mathrm{step}^{n-1}$ is only over-damping where
+`progress` says the steps are not cancelling; under that reading the distance
+still to run is about $\mathrm{step}\,r/(1-r)$ at the observed ratio $r$, not
+$\mathrm{step}$.
 
 **Every solved iterate is accepted**, however large the residual it leaves. The
 penalty narrows the *next* step only; nothing is ever discarded, and a large

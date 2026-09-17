@@ -97,7 +97,7 @@ def optimize_transmission_expansion_iteratively(
     proximal_weight: float = 0.5,
     proximal_adaptive: bool = True,
     proximal_ceiling: float = 4.0,
-    sensitivity_tolerance: float = 1e-5,
+    sensitivity_tolerance: float = 1e-4,
     **kwargs: Any,
 ) -> tuple[str, str]:
     """
@@ -243,15 +243,29 @@ def optimize_transmission_expansion_iteratively(
         than by stationarity. Read ``step`` in ``n.iteration_log`` to tell the
         two apart - a damped iterate is still moving, a converged one is not.
 
-        It doubles as a hurdle rate on capital reallocation: the subgradient at
-        the anchor is ``delta * c_l`` times ``[-1, 1]``, so a branch is moved
-        only where the move returns more than ``delta`` of the capital it
-        shifts. That dead zone is what makes the term selective - a
-        reallocation between two plans of equal cost gains nothing and is
-        refused, while a move worth more than the hurdle is taken at full size.
-        It is also how the term can go wrong: a large enough weight lets the
-        dead zone decide the plan rather than damp the iteration, and a frozen
-        iterate reports itself as a converged one.
+        It prices the step rather than thresholding it. Stationarity of the
+        penalised inner problem gives ``u_l = -r_l / (2 * delta * c_l)`` for a
+        branch of reduced cost ``r_l`` and relative move ``u_l``, so every
+        branch whose reduced cost is non-zero moves, by an amount of order
+        ``1 / delta``: the weight shortens every step in proportion instead of
+        forbidding any particular one. The degeneracy is still broken, but by
+        the strict convexity rather than by a threshold - a reallocation
+        between two plans of equal cost has ``r_l = 0``, so the anchor is the
+        unique minimiser of the penalised problem and the move is refused,
+        while a move worth a little is taken at a reduced size rather than
+        refused with it.
+
+        How the term goes wrong follows from that proportionality: a weight
+        past what the system needs does not freeze the plan, it walks it in
+        slowly. ``step`` then contracts geometrically at a ratio that climbs
+        towards one while ``progress`` stays near one - a monotone walk rather
+        than an orbit - and ``cost_change`` contracts with it, so the cost test
+        is met while the plan is still moving in one direction. Read the two
+        columns of ``n.iteration_log`` together, since a rising
+        ``step[n]/step[n-1]`` is only over-damping where ``progress`` says the
+        steps are not cancelling; under that reading the distance still to run
+        is about ``step * r / (1 - r)`` at the observed ratio ``r``, not
+        ``step``.
 
         ``0`` switches the term off.
 
@@ -348,7 +362,7 @@ def optimize_transmission_expansion_iteratively(
         damp a system whose stability boundary lies above it, which shows up as
         a run that keeps oscillating at the ceiling rather than one that
         reports a wrong answer.
-    sensitivity_tolerance : float, default 1e-5
+    sensitivity_tolerance : float, default 1e-4
         Relative size below which the linearisation of ``scheme='slp'`` drops
         a branch sensitivity, measured against the voltage drop that
         branch causes at its rated capacity. The sensitivity is proportional to
