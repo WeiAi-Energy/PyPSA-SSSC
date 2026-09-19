@@ -39,8 +39,9 @@ total length.
 
 The proxy mentions no solver, no dense-column threshold and no component,
 and the search never tunes one. It also needs nothing from the optimization
-model -- which matters, because :func:`pypsa.pf.find_cycles` runs inside
-``determine_network_topology``, long before a model exists. Weighting the
+model -- which matters, because :func:`pypsa.pf.find_cycles` is driven by
+the lazy :attr:`pypsa.SubNetwork.C`, whose readers include the power flow
+and the diagnostics, not only the optimization. Weighting the
 proxy by the snapshot count and by the capacity-sensitivity columns of an
 iterative expansion was tried and measured: on a 10,000-bus US case it moved
 the result by 0.35 %, which does not justify threading model state into

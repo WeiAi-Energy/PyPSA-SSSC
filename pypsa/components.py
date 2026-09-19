@@ -1452,7 +1452,6 @@ class Network(Basic):
                 c.df.loc[~active, "sub_network"] = np.nan
 
         for sub in self.sub_networks.obj:
-            find_cycles(sub)
             sub.find_bus_controls()
 
     def iterate_components(
@@ -1536,11 +1535,35 @@ class SubNetwork(Common):
     slack_bus: str
     B: spmatrix
     K: spmatrix
-    C: spmatrix
     PTDF: spmatrix
     BODF: spmatrix
 
     list_name = "sub_networks"
+
+    #: Cache behind the lazy :attr:`C`; ``None`` until the cycle basis is
+    #: first needed.
+    _C: spmatrix | None = None
+
+    @property
+    def C(self) -> spmatrix:
+        """
+        Cycle basis matrix, built on first access.
+
+        ``determine_network_topology`` deliberately does not build it: the
+        basis search in :mod:`pypsa.cycle_basis` is the expensive part of
+        topology determination, and only the KVL constraints in
+        :func:`pypsa.optimization.constraints.kirchhoff_voltage_cycles`
+        (and the power flow diagnostics) ever read it. Accessing this
+        attribute runs :func:`pypsa.pf.find_cycles`, which hits the
+        network-level basis cache when the topology is unchanged.
+        """
+        if self._C is None:
+            find_cycles(self)
+        return self._C  # type: ignore[return-value]
+
+    @C.setter
+    def C(self, value: spmatrix) -> None:
+        self._C = value
 
     # Methods
     # ------------------

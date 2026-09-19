@@ -489,10 +489,23 @@ def test_result_does_not_depend_on_pythonhashseed(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def build_all_bases(n) -> None:
+    """
+    Touch every sub-network's cycle basis.
+
+    ``determine_network_topology`` leaves :attr:`pypsa.SubNetwork.C` unbuilt
+    -- the basis search only runs when something reads it -- so a test about
+    the basis cache has to ask for the bases first.
+    """
+    for sub in n.sub_networks.obj:
+        sub.C
+
+
 def test_cache_hits_on_an_unchanged_topology_and_config():
     n = build_network(grid(4, 5), snapshots=4)
     cycle_basis.configure_network(n, fill_config(4))
     n.determine_network_topology()
+    build_all_bases(n)
     cache = n.__dict__["_cycle_basis_cache"]
     assert len(cache) == 1
 
@@ -506,7 +519,9 @@ def test_cache_hits_on_an_unchanged_topology_and_config():
     cycle_basis._refine_cycles_for_fill = counting
     try:
         n.determine_network_topology()
+        build_all_bases(n)
         n.determine_network_topology()
+        build_all_bases(n)
         assert not calls, "an unchanged topology must reuse the cached basis"
         assert len(cache) == 1
     finally:
@@ -526,9 +541,40 @@ def test_cache_misses_when_the_budget_changes():
 
     cycle_basis.configure_network(n, first)
     n.determine_network_topology()
+    build_all_bases(n)
     cycle_basis.configure_network(n, second)
     n.determine_network_topology()
+    build_all_bases(n)
     assert len(n.__dict__["_cycle_basis_cache"]) == 2
+
+
+def test_topology_determination_does_not_build_the_basis():
+    """
+    The basis search is the expensive half of topology determination and only
+    the KVL constraints need its result, so ``determine_network_topology``
+    must leave it undone until someone reads ``sub.C``.
+    """
+    n = build_network(grid(4, 5), snapshots=4)
+    cycle_basis.configure_network(n, fill_config(4))
+
+    calls = []
+    original = cycle_basis.build_cycle_matrix
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    cycle_basis.build_cycle_matrix = counting
+    try:
+        n.determine_network_topology()
+        assert not calls, "topology determination must not build a cycle basis"
+        sub = n.sub_networks.obj.iat[0]
+        assert sub.C is not None
+        assert calls == [1], "reading sub.C must build the basis, exactly once"
+        sub.C
+        assert calls == [1], "a second read must reuse the built basis"
+    finally:
+        cycle_basis.build_cycle_matrix = original
 
 
 def test_cache_returns_a_copy():
