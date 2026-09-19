@@ -19,6 +19,7 @@ from pypsa import (
     clustering,
     components,
     contingency,
+    cycle_basis,
     descriptors,
     examples,
     geo,
