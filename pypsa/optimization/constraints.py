@@ -728,17 +728,33 @@ def define_relative_capacity_deviation(
     would fall short of them by the same factor. The substitution moves the
     spread to the other side of the flow coefficients rather than removing it;
     what removes it is measuring the flows in units of the linearisation
-    capacity, which is not what ``s`` is. Measured on a 4000-bus US case with
-    8457 extendable branches, the coefficients of one voltage-law group run
-    ``2.1e-2 .. 3.0e+2`` without the linearisation and ``1.5e-4 .. 1.2e+4``
-    with it, i.e. the spread within the row widens from 1.4e4 to 7.8e7.
+    capacity, which is not what ``s`` is.
+
+    How much it widens the row is worth keeping in proportion. Measured on the
+    10k-bus US case (``test_10k``, 18798 extendable branches, 20 snapshots) at
+    the second iterate, the voltage-law band runs ``3.9e-7 .. 3.7e-2`` without
+    the linearisation and ``3.9e-7 .. 9.9e-1`` with it: the top of the band
+    rises by a factor of 27, and the spread within the row from 9.3e4 to 2.5e6.
+    Once :func:`kirchhoff_voltage_scale` has centred the band, what this does to
+    the matrix as a whole is to double its largest entry, ``1e+03`` to
+    ``2e+03``. That is not where the cost of an SLP iterate sits: on the same
+    case the linearised iterate is 31 % *below* the un-linearised one in Gurobi
+    work units, because the linearisation also shrinks the factor - and an
+    earlier figure of 1.4e4 to 7.8e7, from a 4000-bus case, predates the
+    band-centring scaling and does not describe this code.
 
     Note also that a presolve which aggregates ``u_l`` out through its own
     defining equation lands back on the capacity formulation, RHS residual
-    included. Gurobi does this on every solve of the case above - the presolved
-    column count is identical with and without the linearisation - so under
-    that solver the reformulation is a no-op, and the choice between the two
-    forms is only felt on a solver that leaves the equation alone.
+    included. Whether Gurobi does so is not something to count on either way.
+    On the 10k-bus case it does **not**: 18744 of the 18798 columns the
+    linearisation adds survive presolve, and so do their rows. Older logs of
+    the 2.5k and 5k cases, taken before the defining equation was scaled by
+    ``sqrt(F_def)`` as below, show the opposite - a presolved column count
+    identical with and without the linearisation. Both were solved with
+    ``Aggregate 0``, so the difference is not a solver setting, but what in the
+    model produced it has not been established. Treat it as measured behaviour
+    of a given revision rather than as a property to rely on: the reformulation
+    is not a no-op under this solver today, whatever it was earlier.
 
     The defining equation itself is written scaled by :math:`\\sqrt{\\bar{F}}`,
 

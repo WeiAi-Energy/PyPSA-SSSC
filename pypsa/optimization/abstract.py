@@ -874,6 +874,25 @@ def optimize_transmission_expansion_iteratively(
         quadratic coefficient identical and leaves the branch-specific scaling
         in linear defining equalities, which is kinder to the solver than
         writing the branch weights into the quadratic objective directly.
+
+        Measured on ``test_2.5k`` at the second iterate: the ``scale`` this
+        form puts in the matrix runs ``0.13 .. 17.9`` on the ``LineX``
+        branches, a spread of 140, and lands inside ``[4e-04, 1e+03]`` - the
+        band the matrix already spans - so it widens nothing, and the
+        ``QObjective`` range stays exactly ``[2, 2]``. Writing the weights into
+        the objective instead means ``w c_l / F_def``, i.e. ``scale ** 2``,
+        which spans ``0.016 .. 320``: a spread of 1.96e4 where there is now
+        none. Taking the square root is what buys that, since it halves the
+        log-spread and parks it among coefficients of the same size. The column
+        and row this costs are under 1 % of the factorisation (``AA' NZ``
+        +0.9 %, ``Factor NZ`` +0.5 % on ``test_10k``), so the trade is
+        one-sided.
+
+        What the term does cost is barrier iterations, and that is not a
+        formulation artefact: on ``test_10k`` it turns a 146-iteration iterate
+        into a 202-iteration one at an unchanged factorisation. It buys a
+        solution the linear iterate does not reach - complementarity 2.3e-7
+        against 3.9e-3, both stopped by the same ``BarConvTol`` gap test.
         """
         m = network.model
         for c in branch_components:
