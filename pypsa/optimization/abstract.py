@@ -33,28 +33,7 @@ logger = logging.getLogger(__name__)
 # which is too long by any margin, in a bounded number of iterations.
 PROXIMAL_ADAPTIVE_FACTOR = 2.0
 
-# Bar on the displacement measure below which ``proximal_adaptive`` reads the
-# iteration as turning rather than walking.
-#
-# Measured on a 1250 bus case against the share of each step that actually
-# closed the distance to the converged plan: while the iteration walks, that
-# share runs 0.42 to 0.70 and the measure reads 0.77 to 0.94; once it stalls,
-# the share collapses to 0.05 to 0.31 - individual steps ending *further* from
-# the answer than they started - and the measure reads 0.46 to 0.68. The two
-# bands meet rather than leaving a gap, so the bar is a boundary drawn inside a
-# continuum, not a value picked out of an empty interval.
-#
-# Inside that continuum the value sits near the upper end of the stalling band
-# rather than above it, which is the conservative end: a stall whose readings
-# fall in the last of its own band, 0.66 to 0.68, goes unanswered. What used to
-# force the bar down this far was the artefact of a
-# change of weight - the iterate after a doubling compares two steps solved
-# under two penalties and read 0.48 to 0.65 on runs that were not turning at
-# all, one of them closing 69 % of its own remaining distance. Those readings
-# are now passed over by the rule itself, which judges only steps solved under
-# one weight, so they no longer constrain the bar; the value is kept because it
-# is the one that was measured, not because the artefact still holds it.
-PROXIMAL_TURN_BAR = 0.65
+PROXIMAL_TURN_BAR = 0.7
 
 # A window of steps that moves less than this share of the capital of the plan
 # itself is numerical noise rather than a direction. Below it the iterate is
