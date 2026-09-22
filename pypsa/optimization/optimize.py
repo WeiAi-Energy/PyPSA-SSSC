@@ -503,7 +503,7 @@ def assign_duals(n: Network, assign_all_duals: bool = False) -> None:
             # The row was written as g(x)/s <= b/s, so only pi/s multiplies (g - b)
             # in the Lagrangian: the solver's multiplier is s times the physical one.
             scale = getattr(n, "_global_constraint_scales", {}).get(attr, 1.0)
-            n.df(c).loc[attr, "mu"] = dual / scale
+            n.df(c).loc[attr, "mu"] = dual * scale
 
     # if unassigned:
     #     logger.info(
