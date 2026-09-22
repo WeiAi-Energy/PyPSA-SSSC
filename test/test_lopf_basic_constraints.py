@@ -101,7 +101,9 @@ def describe_upper_dispatch_constraints(n):
     description = {}
     key = " Upper Limit"
     for c, attr in nominal_attrs.items():
-        dispatch_attr = "p0" if c in ["Line", "Transformer", "Link"] else attr[0]
+        # Branch components carry their flow on p0 and define no "s"/"p" series;
+        # taken from the network so a newly added branch type cannot go missing.
+        dispatch_attr = "p0" if c in n.branch_components else attr[0]
         description[c + key] = pd.Series(
             {
                 "min": (
@@ -119,7 +121,7 @@ def describe_lower_dispatch_constraints(n):
     description = {}
     key = " Lower Limit"
     for c, attr in nominal_attrs.items():
-        if c in ["Line", "Transformer", "Link"]:
+        if c in n.branch_components:
             dispatch_attr = "p0"
             description[c] = pd.Series(
                 {

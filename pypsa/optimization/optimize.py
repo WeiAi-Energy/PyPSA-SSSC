@@ -584,7 +584,9 @@ def post_processing(n: Network) -> None:
         # solving the slack-reduced sparse system avoids ever densifying `sub.B`
         # (a dense pinv of an (n_buses, n_buses) matrix is infeasible for large
         # networks, e.g. 9+ GiB and an O(n^3) SVD for 35k buses).
-        p = n.buses_t.p.reindex(columns=buses_i).to_numpy()
+        # On sns, not on the whole pnl index: n.buses_t.p spans every snapshot of
+        # the network, while only the optimized ones were just solved for.
+        p = n.buses_t.p.reindex(index=sns, columns=buses_i).to_numpy()
         v_ang = np.zeros((len(sns), len(buses_i)))
         v_ang[:, 1:] = spsolve(sub.B[1:, 1:], p[:, 1:].T).T
         return pd.DataFrame(v_ang, sns, buses_i)
