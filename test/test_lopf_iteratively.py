@@ -475,10 +475,13 @@ def test_unconverged_run_reports_its_last_iterate(sssc):
 
 
 
-def test_converged_run_takes_one_full_iteration_with_free_transmission(monkeypatch):
+def test_converged_run_is_closed_by_the_report_solve(monkeypatch):
     """
-    A converged run takes one more ordinary iteration to assign the full
-    solution. Its branch capacities remain free and its SLP terms remain active.
+    Every run is closed by the pinned report solve, converged or not. It holds
+    the transmission capacities at the converged iterate and puts the
+    impedances on them, so the plan it reports agrees with its own impedances.
+    It carries neither the sensitivity nor the proximal penalty, but it does
+    carry the duals and the derived time series.
     """
     n = _build_meshed_network()
     bounds = n.lines[["s_nom_min", "s_nom_max"]].copy()
@@ -508,18 +511,27 @@ def test_converged_run_takes_one_full_iteration_with_free_transmission(monkeypat
     assert not any(assigned for assigned, _, _ in solves[:-1])
     assigned, final_bounds, final_sensitivity = solves[-1]
     assert assigned is True
-    pd.testing.assert_frame_equal(final_bounds, bounds)
-    assert final_sensitivity is not None
+    assert final_sensitivity is None
 
     ext = n.lines.s_nom_extendable
-    # The extra solve uses the converged plan as its linearisation point.
+    # the report solve was held at the converged capacities ...
     pd.testing.assert_series_equal(
-        n.lines._s_nom_def[ext], n.lines[f"s_nom_opt_{len(log)}"][ext],
+        final_bounds.s_nom_min[ext], final_bounds.s_nom_max[ext],
+        check_names=False,
+    )
+    pd.testing.assert_series_equal(
+        n.lines.s_nom_opt[ext], n.lines[f"s_nom_opt_{len(log)}"][ext],
         rtol=1e-9, check_names=False,
     )
-    assert "Line-s_nom_deviation" in n.model.variables
-    assert "Line-s_nom_relative" in n.model.variables
-    assert bool(n.model.objective.is_quadratic)
+    # ... and the impedances are those of the same capacities
+    pd.testing.assert_series_equal(
+        n.lines.s_nom_opt[ext], n.lines._s_nom_def[ext],
+        rtol=1e-9, check_names=False,
+    )
+    # it is the plain formulation: no step control survives into it
+    assert "Line-s_nom_deviation" not in n.model.variables
+    assert "Line-s_nom_relative" not in n.model.variables
+    assert not bool(n.model.objective.is_quadratic)
     assert n._kvl_capacity_sensitivity is None
     pd.testing.assert_frame_equal(n.lines[["s_nom_min", "s_nom_max"]], bounds)
     # and the export is that of a full solve: capacities, dispatch and duals
@@ -532,28 +544,46 @@ def test_converged_run_takes_one_full_iteration_with_free_transmission(monkeypat
     assert all("dual" in con for _, con in n.model.constraints.items())
 
 
-def test_converged_final_iteration_can_change_transmission_capacities():
-    """The final SLP solve takes a free capacity step from its anchor."""
+@pytest.mark.parametrize("scheme", ["slp", "fixed_point"])
+def test_the_report_solve_pins_the_plan_under_either_scheme(scheme):
+    """
+    Even a run stopped after a long step reports a plan consistent with its
+    impedances: the report solve does not take one more step from it, and the
+    transmission expansion limits it would otherwise enforce are dropped
+    there, then restored.
+    """
     n = _build_meshed_network()
+    n.add(
+        "GlobalConstraint", "lv_limit", type="transmission_volume_expansion_limit",
+        carrier_attribute="AC", sense="<=", constant=1e9,
+    )
+    constraints = n.global_constraints.copy()
     bounds = n.lines[["s_nom_min", "s_nom_max"]].copy()
     n.optimize.optimize_transmission_expansion_iteratively(
+        scheme=scheme,
         max_iterations=3,
         cost_threshold=1.0,
         step_threshold=1.0,
         proximal=False,
-        solver_name="highs",
-        solver_options={"log_to_console": False},
+        **SOLVER,
     )
 
     assert len(n.iteration_log) == 2
-    assert "Line-s_nom_relative" in n.model.variables
-    assert (n.lines.s_nom_opt - n.lines._s_nom_def).abs().max() > 1e-4
+    ext = n.lines.s_nom_extendable
+    pd.testing.assert_series_equal(
+        n.lines.s_nom_opt[ext], n.lines._s_nom_def[ext],
+        rtol=1e-9, check_names=False,
+    )
+    assert "Line-s_nom_relative" not in n.model.variables
+    assert "GlobalConstraint-lv_limit" not in n.model.constraints
     pd.testing.assert_frame_equal(n.lines[["s_nom_min", "s_nom_max"]], bounds)
+    pd.testing.assert_index_equal(n.global_constraints.index, constraints.index)
 
 
-def test_converged_final_iteration_reoptimises_generation_and_transmission():
+def test_the_report_solve_reoptimises_everything_but_transmission():
     """
-    The full iteration keeps both generation and transmission capacities free.
+    The transmission capacities are pinned; the generation, storage and
+    dispatch are not, which is what makes the result the cost *of* that plan.
     """
     n = _build_meshed_network()
     n.generators["p_nom_extendable"] = True
@@ -565,7 +595,13 @@ def test_converged_final_iteration_reoptimises_generation_and_transmission():
         max_iterations=40, **SOLVER
     )
 
-    assert "Line-s_nom" in n.model.variables
+    # the branch capacities the report solve was held at
+    ext = n.lines.s_nom_extendable
+    pd.testing.assert_series_equal(
+        n.lines.s_nom_opt[ext], n.lines._s_nom_def[ext],
+        rtol=1e-9, check_names=False,
+    )
+    # the generators were free in it, and their bounds are unchanged
     assert "Generator-p_nom" in n.model.variables
     pd.testing.assert_frame_equal(
         n.generators[["p_nom_min", "p_nom_max"]], bounds
@@ -772,10 +808,11 @@ def test_proximal_term_does_not_distort_the_optimum():
         # scaled free-deviation variable, so the inner problem becomes a QP.
         assert any(present for present, _ in inner[:-1]) == on
         assert any(quadratic for _, quadratic in inner[:-1]) == on
-        # The full solve after convergence is another ordinary iteration.
-        assert inner[-1][0] is on
-        assert ("Line-s_nom_deviation" in n.model.variables) is on
-        assert bool(n.model.objective.is_quadratic) is on
+        # the report solve that closes the run carries no penalty, so the
+        # model left on the network never has the deviation variable
+        assert inner[-1][0] is False
+        assert "Line-s_nom_deviation" not in n.model.variables
+        assert not bool(n.model.objective.is_quadratic)
         # and the weight it was solved with is reported per iteration
         assert (log.proximal.fillna(0.0) > 0.0).any() == on
 

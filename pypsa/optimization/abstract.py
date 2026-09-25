@@ -42,8 +42,8 @@ PROXIMAL_TURN_BAR = 0.7
 PROXIMAL_STEP_FLOOR = 1e-9
 
 # Global constraints written over the transmission capacities themselves. The
-# report solve after exhausting the iteration budget can omit them because it
-# holds those capacities. See ``exclude_transmission_limits``.
+# report solve that closes every run omits them because it holds those
+# capacities. See ``exclude_transmission_limits``.
 TRANSMISSION_LIMIT_TYPES = (
     "transmission_expansion_cost_limit",
     "transmission_volume_expansion_limit",
@@ -112,9 +112,13 @@ def optimize_transmission_expansion_iteratively(
         outer loop. If tracking is enabled, the requested nominal-capacity
         columns and objective scalars are retained as well. Complete primal
         results, duals and derived network time series come from one full solve
-        after the loop. On convergence, this is one more ordinary iteration
-        with free transmission capacities. After exhausting ``max_iterations``,
-        it reports the last iterate with its transmission capacities fixed.
+        after the loop, the report solve. It holds the extendable ``Line``,
+        ``LineX`` and DC ``Link`` capacities at the last accepted iterate,
+        whether the loop converged or exhausted ``max_iterations``, and puts
+        the impedances on those same capacities, so the reported plan is
+        consistent with its own impedances. The transmission expansion limits
+        are left out of it, since they only constrain capacities it holds, and
+        so carry no ``mu`` from that solve.
     scheme : {'slp', 'fixed_point'}, default 'slp'
         How the capacity dependence of the voltage law is resolved.
 
@@ -132,9 +136,10 @@ def optimize_transmission_expansion_iteratively(
             branch capacity, evaluated at the previous iterate, so the inner
             problem accounts for the change of the voltage law its own step
             causes. The first iteration is a fixed-point step, since no
-            linearisation point exists yet. After convergence, one more
-            ordinary iteration is solved with the converged capacities as its
-            linearisation point and with transmission capacities free.
+            linearisation point exists yet. The report solve after the loop
+            carries neither the sensitivity nor the proximal term: its
+            capacities are pinned at the linearisation point, where the
+            first-order term vanishes.
 
         A linearisation is only valid over a limited step, which is what
         the proximal term below is for, and it therefore applies to
@@ -438,9 +443,8 @@ def optimize_transmission_expansion_iteratively(
         c for c in ("Line", "LineX") if c in n.components and not n.df(c).empty
     ]
     # DC links carry no voltage law, so the iteration does not linearise them.
-    # If the budget is exhausted, the report solve holds their capacities with
-    # the AC capacities. Other links may model conversion assets, which remain
-    # free in that solve.
+    # The report solve holds their capacities with the AC capacities. Other
+    # links may model conversion assets, which remain free in that solve.
     link_ext_i = pd.Index([], name="Link")
     if "Link" in n.components and not n.links.empty:
         extendable = n.links.get("p_nom_extendable")
@@ -1145,9 +1149,10 @@ def optimize_transmission_expansion_iteratively(
         """
         Fix the extendable branch capacities at ``center``.
 
-        Used by the report solve after exhausting ``max_iterations``. That
-        solve costs the last accepted plan at its own impedances. Leaving the
-        capacities free would take another step from that plan.
+        Used by the report solve that closes every run. That solve costs the
+        last accepted plan at its own impedances. Leaving the capacities free
+        would take another step from that plan and return capacities that
+        disagree with the impedances they were solved at.
 
         The DC links are held too, at the capacities of the same solve. They
         carry no voltage law and so never enter the iteration's own controls,
@@ -1250,8 +1255,8 @@ def optimize_transmission_expansion_iteratively(
     previous_weight: float | None = None
 
     reference_terms: pd.DataFrame | None = None
-    # Last solved DC link capacities, held alongside the AC capacities only
-    # when an unconverged run is reported at its last iterate.
+    # Last solved DC link capacities, held alongside the AC capacities by the
+    # report solve.
     current_links: pd.Series | None = None
     plain_step = False
     has_converged = False
@@ -1492,11 +1497,9 @@ def optimize_transmission_expansion_iteratively(
                 current_def = clip_branch_caps(
                     caps.copy(), branch_cap_min, branch_cap_max
                 )
-                if linearised:
-                    reference_terms = cycle_terms
                 cost_history.append(cost)
-                # The full solve below takes one more ordinary step from this
-                # point, so the lightweight model is no longer needed.
+                # The report solve below pins this point, so the lightweight
+                # model is no longer needed.
                 discard_model(n)
                 break
 
@@ -1542,13 +1545,15 @@ def optimize_transmission_expansion_iteratively(
         del n.model
         gc.collect()
 
-    # The lightweight iterates do not assign a full network solution. After
-    # convergence, take one more full iteration with the same linearisation
-    # and step control, leaving transmission capacities free. If the iteration
-    # budget was exhausted, report the last plan at its own impedances instead.
+    # The lightweight iterates do not assign a full network solution. Every
+    # run, under either scheme and converged or not, is closed by the report
+    # solve: the impedances are put on the capacities of the last accepted
+    # iterate and those capacities are pinned, so the plan the network carries
+    # is the one its own impedances were computed from. A free solve would take
+    # one more step and return capacities that disagree with them.
     logger.info(
-        "Preparing final solve with updated transmission parameters at the "
-        "capacities of the %s iterate.",
+        "Preparing report solve with transmission capacities pinned at the "
+        "%s iterate.",
         "converged" if has_converged else "last",
     )
     last_success_status, last_success_condition = status, condition
@@ -1557,31 +1562,16 @@ def optimize_transmission_expansion_iteratively(
 
     original_global_constraints = n.global_constraints
     try:
-        if has_converged:
-            n._kvl_capacity_sensitivity = (
-                capacity_sensitivity(reference_terms, current_def)
-                if linearised and reference_terms is not None
-                else None
-            )
-            anchor = current_def
-            weight = proximal_delta
-        else:
-            n._kvl_capacity_sensitivity = None
-            pin_capacities(n, current_def, current_links)
-            original_global_constraints = exclude_transmission_limits(n)
-            anchor = None
-            weight = 0.0
+        # at pinned capacities the voltage law is exact at its zeroth order,
+        # so neither the sensitivity nor the step penalty has anything to do
+        n._kvl_capacity_sensitivity = None
+        pin_capacities(n, current_def, current_links)
+        original_global_constraints = exclude_transmission_limits(n)
         n.calculate_dependent_values()
         status, condition = solve_once(
             snapshots,
-            extra_functionality=extra_functionality_for(anchor, weight),
+            extra_functionality=extra_functionality_for(None, 0.0),
         )
-        if status == "ok" and weight > 0.0 and anchor is not None:
-            # The ordinary final iteration includes a step penalty, but the
-            # public objective reports system cost, as the iteration log does.
-            n.objective -= weight * proximal_term_value(
-                collect_branch_caps("s_nom_opt"), anchor
-            )
     finally:
         n._kvl_capacity_sensitivity = None
         restore_nominal_bounds(n)
