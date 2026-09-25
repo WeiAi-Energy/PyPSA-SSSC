@@ -474,7 +474,7 @@ class CycleBasisConfig:
         converges in about 35 seconds.
     """
 
-    time_budget: float = 100.0
+    time_budget: float = 300.0
 
     def fingerprint(self) -> str:
         """Content hash of everything that can change the result."""
